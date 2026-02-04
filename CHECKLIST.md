@@ -18,9 +18,9 @@
 - [x] Mécaniques par niveau (gravité locale, croquettes oxydées)
 - [x] Boss final (phases + barre de vie + conclusion narrative)
 
-## Phase 3 - Finition (à lancer)
-- [ ] High-scores sauvegardés
-- [ ] Support manette
-- [ ] Écran de victoire final + crédits riches
-- [ ] Filtres CRT / scanlines
-- [ ] Équilibrage et polish global
+## Phase 3 - Finition (terminee)
+- [x] High-scores sauvegardés
+- [x] Support manette
+- [x] Écran de victoire final + crédits riches
+- [x] Filtres CRT / scanlines
+- [x] Équilibrage et polish global

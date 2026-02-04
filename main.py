@@ -3,6 +3,8 @@ import sys
 import random
 import math
 import textwrap
+import json
+from datetime import datetime
 from pathlib import Path
 
 # Importer la configuration des niveaux
@@ -12,12 +14,45 @@ level_idx = 0
 
 # Initialisation de Pygame
 pygame.init()
+pygame.joystick.init()
 
 # Dimensions de la fenêtre (agrandies)
 screen_width = 800
 screen_height = 600
 screen = pygame.display.set_mode((screen_width, screen_height))
 pygame.display.set_caption("AstroPaws")
+
+crt_filter_enabled = True
+
+def build_crt_overlays(width, height):
+    scanlines = pygame.Surface((width, height), pygame.SRCALPHA)
+    for y in range(0, height, 4):
+        pygame.draw.line(scanlines, (0, 0, 0, 50), (0, y), (width, y))
+    vignette = pygame.Surface((width, height), pygame.SRCALPHA)
+    center_x, center_y = width / 2, height / 2
+    max_dist = math.hypot(center_x, center_y)
+    for y in range(height):
+        for x in range(width):
+            dist = math.hypot(x - center_x, y - center_y)
+            alpha = int(max(0, min(90, (dist / max_dist) ** 2.2 * 90)))
+            if alpha:
+                vignette.set_at((x, y), (0, 0, 0, alpha))
+    return scanlines, vignette
+
+crt_scanline_overlay, crt_vignette_overlay = build_crt_overlays(screen_width, screen_height)
+
+def apply_crt_overlay():
+    if not crt_filter_enabled:
+        return
+    ghost = screen.copy()
+    ghost.set_alpha(18)
+    screen.blit(ghost, (1, 0))
+    screen.blit(crt_scanline_overlay, (0, 0))
+    screen.blit(crt_vignette_overlay, (0, 0))
+
+def present_frame():
+    apply_crt_overlay()
+    pygame.display.flip()
 
 # Audio optionnel : le jeu reste jouable même sans périphérique audio.
 try:
@@ -39,7 +74,7 @@ GREEN = (0, 255, 0)
 RED   = (255, 0, 0)
 CYAN  = (0, 255, 255)
 
-GAME_VERSION = "2026-02-04.1"
+GAME_VERSION = "2026-02-04.2"
 
 INITIAL_LIVES = 9
 INITIAL_WATER_AMMO = 50
@@ -67,6 +102,22 @@ OXIDIZED_WATER_PENALTY = 4
 OXIDIZED_DEBUFF_DURATION = 1800
 
 BOSS_MAX_HEALTH = 72
+
+HIGHSCORE_FILE = ROOT_DIR / "highscores.json"
+MAX_HIGHSCORES = 8
+
+CONTROLLER_DEADZONE = 0.28
+CONTROLLER_CONFIRM_BUTTONS = {0, 7}
+CONTROLLER_BACK_BUTTONS = {1, 6}
+CONTROLLER_SHOOT_BUTTONS = {0, 5}
+CONTROLLER_SHIELD_BUTTONS = {2}
+CONTROLLER_HYPER_BUTTONS = {3}
+CONTROLLER_PAUSE_BUTTONS = {7}
+CONTROLLER_CRT_TOGGLE_BUTTONS = {4}
+
+BALANCE_BASE_SPAWN = {0: 0.018, 1: 0.022, 2: 0.027}
+BALANCE_WATER_PICKUP_BASE = {0: 0.0055, 1: 0.0062, 2: 0.0068}
+BALANCE_COOLDOWN_BASE = {0: 290, 1: 270, 2: 250}
 
 # Le cooldown est récupéré depuis la config de niveau si disponible.
 hyper_level_cfg = next(
@@ -376,6 +427,127 @@ def start_boss_fight(now_ms):
     boss_contact_cooldown_until = 0
     game_state = "BOSS_INTRO"
 
+def load_highscores():
+    if not HIGHSCORE_FILE.exists():
+        return []
+    try:
+        raw_data = json.loads(HIGHSCORE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    cleaned = []
+    for entry in raw_data if isinstance(raw_data, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        score_value = int(entry.get("score", 0))
+        cleaned.append({
+            "score": score_value,
+            "result": str(entry.get("result", "Run")),
+            "duration": int(entry.get("duration", -1)),
+            "stamp": str(entry.get("stamp", "")),
+        })
+    cleaned.sort(key=lambda it: (-it["score"], it["duration"] if it["duration"] >= 0 else 999999))
+    return cleaned[:MAX_HIGHSCORES]
+
+def save_highscores(entries):
+    try:
+        HIGHSCORE_FILE.write_text(
+            json.dumps(entries[:MAX_HIGHSCORES], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+def get_level_spawn_chance(level_index, score_value, lives_value, boss_on):
+    if boss_on:
+        return 0.0
+    base = BALANCE_BASE_SPAWN.get(level_index, 0.03)
+    score_pressure = min(0.018, max(0, score_value) * 0.00009)
+    survival_relief = -0.006 if lives_value <= 2 else 0.0
+    return max(0.010, min(0.055, base + score_pressure + survival_relief))
+
+def get_water_pickup_spawn_chance(level_index, boss_on, water_value):
+    if boss_on:
+        return 0.011
+    base = BALANCE_WATER_PICKUP_BASE.get(level_index, 0.0065)
+    low_water_bonus = 0.0035 if water_value <= 20 else 0.0
+    return min(0.018, base + low_water_bonus)
+
+def get_shot_cooldown(level_index, boss_on):
+    if boss_on:
+        return 220
+    return BALANCE_COOLDOWN_BASE.get(level_index, 250)
+
+def normalize_axis(value):
+    return 0.0 if abs(value) < CONTROLLER_DEADZONE else float(value)
+
+active_controller = None
+
+def refresh_controller():
+    global active_controller
+    active_controller = None
+    for idx in range(pygame.joystick.get_count()):
+        joystick = pygame.joystick.Joystick(idx)
+        if not joystick.get_init():
+            joystick.init()
+        active_controller = joystick
+        break
+
+def get_controller_move_vector():
+    if active_controller is None:
+        return 0.0, 0.0
+    axis_x = normalize_axis(active_controller.get_axis(0)) if active_controller.get_numaxes() > 0 else 0.0
+    axis_y = normalize_axis(active_controller.get_axis(1)) if active_controller.get_numaxes() > 1 else 0.0
+    if active_controller.get_numhats() > 0:
+        hat_x, hat_y = active_controller.get_hat(0)
+        if hat_x != 0:
+            axis_x = float(hat_x)
+        if hat_y != 0:
+            axis_y = float(-hat_y)
+    return axis_x, axis_y
+
+def handle_global_event(event):
+    global crt_filter_enabled
+    if event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+        refresh_controller()
+    if event.type == pygame.KEYDOWN and event.key == pygame.K_f:
+        crt_filter_enabled = not crt_filter_enabled
+    elif event.type == pygame.JOYBUTTONDOWN and event.button in CONTROLLER_CRT_TOGGLE_BUTTONS:
+        crt_filter_enabled = not crt_filter_enabled
+
+def facing_to_vector(facing_value):
+    if facing_value == "left":
+        return -1.0, 0.0
+    if facing_value == "right":
+        return 1.0, 0.0
+    if facing_value == "up":
+        return 0.0, -1.0
+    return 0.0, 1.0
+
+def fire_player_bullet(direction_x, direction_y, current_time):
+    global next_shot_allowed_time, water_ammo
+    if current_time < next_shot_allowed_time or water_ammo <= 0:
+        return False
+    magnitude = math.hypot(direction_x, direction_y)
+    if magnitude <= 0:
+        direction_x, direction_y = facing_to_vector(astro_facing)
+        magnitude = math.hypot(direction_x, direction_y)
+    direction_x = direction_x / magnitude * bullet_speed
+    direction_y = direction_y / magnitude * bullet_speed
+    bullet_rect = pygame.Rect(
+        astro_x + 25 - bullet_width // 2,
+        astro_y + 25 - bullet_height // 2,
+        bullet_width,
+        bullet_height,
+    )
+    bullet = {'rect': bullet_rect, 'dx': direction_x, 'dy': direction_y}
+    bullet_list.append(bullet)
+    next_shot_allowed_time = current_time + cooldown_time
+    water_ammo -= 1
+    play_sound(shoot_sound)
+    return True
+
+refresh_controller()
+
 def load_sound(filename, volume=0.6):
     if not pygame.mixer.get_init():
         return None
@@ -465,11 +637,11 @@ def warp_effect():
             x2 = center_x + ddx * 1.15
             y2 = center_y + ddy * 1.15
             pygame.draw.circle(screen, WHITE, (int(x2), int(y2)), 1)
-        pygame.display.flip()
+        present_frame()
         pygame.time.delay(70)  # délai encore un peu plus long pour percevoir l'effet
     # Flash blanc
     screen.fill(WHITE)
-    pygame.display.flip()
+    present_frame()
     pygame.time.delay(100)
     # Régénérer les étoiles pour le prochain level
     for star in star_list:
@@ -677,6 +849,75 @@ pygame.font.init()
 score_font = pygame.font.SysFont(None, 48)
 # Police plus petite pour les sous-titres et les blagues
 subtitle_font = pygame.font.SysFont(None, 32)
+highscore_font = pygame.font.SysFont(None, 24)
+
+highscores = load_highscores()
+run_recorded = False
+latest_highscore_stamp = None
+
+credits_lines = [
+    "Direction creative: Dr John 8bit",
+    "Code gameplay: AstroPaws Crew",
+    "Art et sprites: Atelier Felin Spatial",
+    "Audio chiptune: Studio Croquettes FM",
+    "Tests et feedback: Communaute AstroPaws",
+]
+
+def format_duration(seconds):
+    if seconds < 0:
+        return "--:--"
+    mins, secs = divmod(seconds, 60)
+    return f"{mins:02d}:{secs:02d}"
+
+def record_run_result(result_label, now_ms):
+    global highscores, run_recorded, latest_highscore_stamp
+    if run_recorded:
+        return
+    elapsed_seconds = -1
+    if game_start_time is not None:
+        elapsed_seconds = max(0, (now_ms - game_start_time - paused_time_accum) // 1000)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = {
+        "score": int(score),
+        "result": result_label,
+        "duration": int(elapsed_seconds),
+        "stamp": stamp,
+    }
+    highscores.append(entry)
+    highscores.sort(key=lambda item: (-item["score"], item["duration"] if item["duration"] >= 0 else 999999))
+    highscores = highscores[:MAX_HIGHSCORES]
+    latest_highscore_stamp = stamp
+    save_highscores(highscores)
+    run_recorded = True
+
+def draw_highscore_panel(pos_x, pos_y, max_rows=5):
+    panel_width = 300
+    row_height = 22
+    panel_height = 42 + max_rows * row_height
+    panel_rect = pygame.Rect(pos_x, pos_y, panel_width, panel_height)
+    panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+    panel.fill((8, 8, 18, 140))
+    pygame.draw.rect(panel, (145, 145, 190, 130), panel.get_rect(), 1)
+    title = highscore_font.render("Hall of Fame", True, GOLD)
+    panel.blit(title, (10, 8))
+    if not highscores:
+        empty = highscore_font.render("Aucun score.", True, WHITE)
+        panel.blit(empty, (10, 24))
+    else:
+        for idx, entry in enumerate(highscores[:max_rows]):
+            row_y = 24 + idx * row_height
+            row_color = WHITE
+            if latest_highscore_stamp is not None and entry.get("stamp") == latest_highscore_stamp:
+                row_color = CYAN
+            rank = highscore_font.render(f"{idx+1}.", True, row_color)
+            label = highscore_font.render(
+                f"{entry.get('score', 0):>4}  {entry.get('result', 'Run')[:3].upper()}  {format_duration(entry.get('duration', -1))}",
+                True,
+                row_color,
+            )
+            panel.blit(rank, (8, row_y))
+            panel.blit(label, (34, row_y))
+    screen.blit(panel, panel_rect.topleft)
 
 next_shot_allowed_time = 0
 cooldown_time = 300
@@ -782,6 +1023,7 @@ def reset_run_state(start_state="LEVEL_INTRO"):
     global hyper_unlocked, hyper_inv_anim, hyper_last_fx_time, oxidized_debuff_until
     global gravity_pull_strength, gravity_pull_planet
     global boss_active, boss_defeated, boss_data, boss_projectiles, boss_contact_cooldown_until
+    global run_recorded, latest_highscore_stamp
     global ingredients_collected, ing_anim_active, ing_anim_start
     global paused_time_accum, pause_start_time, level_idx, game_state, next_shot_allowed_time
     global enemy_list, explosion_list, bullet_list, water_item_list, hyper_item_list, croquette_list
@@ -822,6 +1064,8 @@ def reset_run_state(start_state="LEVEL_INTRO"):
     boss_data = {}
     boss_projectiles = []
     boss_contact_cooldown_until = 0
+    run_recorded = False
+    latest_highscore_stamp = None
     ingredients_collected = []
     ing_anim_active = False
     ing_anim_start = 0
@@ -844,6 +1088,7 @@ while running:
     # Temps courant
     now = pygame.time.get_ticks()
     set_music(music_for_state(game_state))
+    cooldown_time = get_shot_cooldown(level_idx, boss_active)
     # Initialiser le chronomètre au début du jeu
     if game_state == "PLAYING" and game_start_time is None:
         game_start_time = now
@@ -872,10 +1117,14 @@ while running:
     if game_state == "INFO":
         # Événements
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
+                    game_state = "MENU"
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS or event.button in CONTROLLER_BACK_BUTTONS:
                     game_state = "MENU"
         # Fond uni pour l'écran INFO
         screen.fill(BLACK)
@@ -898,7 +1147,7 @@ while running:
             (rat_sprite,    "Rat : 1 tir pour tuer, +20pts, collision -10pts."),
             (dog_sprite,    "Chien : 3 tirs pour tuer, +30pts, collision -1 vie."),
             (None,          f"Score requis : {levels.levels[0]['target_score']} -> N2, {levels.levels[1]['target_score']}-> N3, {levels.levels[2]['target_score']}-> Boss"),
-            (None,          "N2+: gravite locale et croquettes oxydees (risque/recompense).")
+            (None,          "N2+: gravite locale, croquettes oxydees + manette (A/X/Y/START), CRT (F/LB).")
         ]
         # Affichage
         y = 60
@@ -928,21 +1177,26 @@ while running:
             screen.blit(txt_surf, (x_text, y + 8))
             y += 50
         # Bas de page
-        hint = subtitle_font.render("Press SPACE to return", True, GREEN)
+        hint = subtitle_font.render("SPACE/A: retour  |  F/LB: filtre CRT", True, GREEN)
         # Remonter le message pour éviter chevauchement
         hint_rect = hint.get_rect(midbottom=(screen_width//2, screen_height - 10))
         screen.blit(hint, hint_rect)
-        pygame.display.flip()
+        present_frame()
         continue
 
     # === Écran STORY ===
     if game_state == "STORY":
         # Gestion des événements pour sortir de la Story
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_SPACE, pygame.K_ESCAPE, pygame.K_RETURN):
+                    story_scroll_y = float(screen_height)
+                    game_state = "MENU"
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS or event.button in CONTROLLER_BACK_BUTTONS:
                     story_scroll_y = float(screen_height)
                     game_state = "MENU"
         # Animer fond (étoiles+planètes)
@@ -983,13 +1237,14 @@ while running:
         if story_scroll_y + len(display_lines)*line_height < 0:
             story_scroll_y = float(screen_height)
             game_state = "MENU"
-        pygame.display.flip()
+        present_frame()
         continue
 
     # === Écran MENU ===
     if game_state == "MENU":
         # Gestion des événements pour quitter, démarrer ou story/info
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
@@ -1002,6 +1257,16 @@ while running:
                     running = False
                 elif event.key == pygame.K_i:
                     game_state = "INFO"
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS:
+                    reset_run_state("LEVEL_INTRO")
+                elif event.button == 3:
+                    story_scroll_y = float(screen_height)
+                    game_state = "STORY"
+                elif event.button == 2:
+                    game_state = "INFO"
+                elif event.button in CONTROLLER_BACK_BUTTONS:
+                    running = False
         # Animation de fond (étoiles et planètes)
         for star in star_list:
             star['x'] += star['speed']
@@ -1043,16 +1308,26 @@ while running:
         prompt4 = score_font.render("PRESS I FOR INFO", True, WHITE)
         prompt4_rect = prompt4.get_rect(center=(screen_width//2, prompt_y_base + 120))
         screen.blit(prompt4, prompt4_rect)
+        controller_label = "Controller: connecte" if active_controller else "Controller: clavier"
+        controller_surf = subtitle_font.render(controller_label, True, CYAN if active_controller else WHITE)
+        controller_rect = controller_surf.get_rect(center=(screen_width//2, prompt_y_base + 160))
+        screen.blit(controller_surf, controller_rect)
+        crt_state = "ON" if crt_filter_enabled else "OFF"
+        crt_surf = subtitle_font.render(f"Filtre CRT (F/LB): {crt_state}", True, WHITE)
+        crt_rect = crt_surf.get_rect(center=(screen_width//2, prompt_y_base + 192))
+        screen.blit(crt_surf, crt_rect)
+        draw_highscore_panel(screen_width - 316, 16, max_rows=4)
         # Affichage de la version (date.build) en bas à droite du menu
         version_surf = subtitle_font.render(f"Version {GAME_VERSION}", True, WHITE)
         version_rect = version_surf.get_rect(bottomright=(screen_width - 10, screen_height - 10))
         screen.blit(version_surf, version_rect)
-        pygame.display.flip()
+        present_frame()
         continue
     # === Écran LEVEL_INTRO ===
     if game_state == "LEVEL_INTRO":
         # Gérer la sortie ou continuer
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
@@ -1061,6 +1336,12 @@ while running:
                     warp_effect()
                     game_state = "PLAYING"
                 elif event.key == pygame.K_q:
+                    running = False
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS:
+                    warp_effect()
+                    game_state = "PLAYING"
+                elif event.button in CONTROLLER_BACK_BUTTONS:
                     running = False
         # Fond étoilé
         screen.fill(BLACK)
@@ -1117,15 +1398,16 @@ while running:
             screen.blit(surf, rect)
 
         # Poursuivre
-        cont_surf = score_font.render("Press C to continue", True, GREEN)
+        cont_surf = score_font.render("Press C / A to continue", True, GREEN)
         cont_rect = cont_surf.get_rect(center=(screen_width//2, screen_height - 50))
         screen.blit(cont_surf, cont_rect)
-        pygame.display.flip()
+        present_frame()
         continue
 
     # === Écran BOSS_INTRO ===
     if game_state == "BOSS_INTRO":
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
@@ -1133,6 +1415,12 @@ while running:
                     warp_effect()
                     game_state = "PLAYING"
                 elif event.key == pygame.K_q:
+                    running = False
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS:
+                    warp_effect()
+                    game_state = "PLAYING"
+                elif event.button in CONTROLLER_BACK_BUTTONS:
                     running = False
 
         screen.fill(BLACK)
@@ -1161,10 +1449,10 @@ while running:
         screen.blit(line2, line2.get_rect(center=(screen_width // 2, 394)))
         screen.blit(line3, line3.get_rect(center=(screen_width // 2, 428)))
 
-        cont_surf = score_font.render("Press C to engage", True, GREEN)
+        cont_surf = score_font.render("Press C / A to engage", True, GREEN)
         cont_rect = cont_surf.get_rect(center=(screen_width//2, screen_height - 50))
         screen.blit(cont_surf, cont_rect)
-        pygame.display.flip()
+        present_frame()
         continue
 
     # === Écran REWARD (Bouclier acquis) ===
@@ -1186,13 +1474,13 @@ while running:
         srect = small.get_rect(center=(screen_width//2, screen_height//2 + 10))
         screen.blit(small, srect)
         # Informations sur le bouclier
-        info1 = score_font.render("Appuyez sur H pour activer le bouclier", True, WHITE)
+        info1 = score_font.render("H / X pour activer le bouclier", True, WHITE)
         info1_rect = info1.get_rect(center=(screen_width//2, screen_height//2 + 80))
         screen.blit(info1, info1_rect)
         info2 = score_font.render(f"Durée: {shield_duration//1000}s   Utilisations: 1", True, WHITE)
         info2_rect = info2.get_rect(center=(screen_width//2, screen_height//2 + 120))
         screen.blit(info2, info2_rect)
-        pygame.display.flip()
+        present_frame()
         pygame.time.delay(2000)
         # Octroi de la charge de bouclier
         shield_charges = 1
@@ -1206,6 +1494,7 @@ while running:
     if game_state == "PAUSE":
         # Gestion des événements pour reprendre ou quitter
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
@@ -1214,6 +1503,13 @@ while running:
                     pause_start_time = None
                     game_state = "PLAYING"
                 elif event.key == pygame.K_q:
+                    running = False
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS or event.button in CONTROLLER_PAUSE_BUTTONS:
+                    paused_time_accum += now - pause_start_time
+                    pause_start_time = None
+                    game_state = "PLAYING"
+                elif event.button in CONTROLLER_BACK_BUTTONS:
                     running = False
         # Affichage du menu pause
         screen.fill(BLACK)
@@ -1264,29 +1560,37 @@ while running:
             pause_rect = pause_surf.get_rect(center=(screen_width//2, screen_height//3))
             screen.blit(pause_surf, pause_rect)
         # Options colorées
-        resume_surf = score_font.render("Press P to resume", True, GREEN)
+        resume_surf = score_font.render("Press P / START to resume", True, GREEN)
         resume_rect = resume_surf.get_rect(center=(screen_width//2, screen_height//2))
         screen.blit(resume_surf, resume_rect)
-        quit_surf = score_font.render("Press Q to quit", True, RED)
+        quit_surf = score_font.render("Press Q / B to quit", True, RED)
         # Placer le texte "Quit" juste sous "Resume"
         quit_rect = quit_surf.get_rect(center=(screen_width//2, screen_height//2 + 60))
         screen.blit(quit_surf, quit_rect)
         # Afficher le chat endormi en bas de l'écran de pause
         chat_rect = chat_sleep_image.get_rect(midbottom=(screen_width//2, screen_height - 10))
         screen.blit(chat_sleep_image, chat_rect)
-        pygame.display.flip()
+        present_frame()
         continue
 
     # === Écran GAME_OVER ===
     if game_state == "GAME_OVER":
+        if not run_recorded:
+            record_run_result("KO", now)
         # Gestion des événements
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_r:
                     reset_run_state("MENU")
                 elif event.key == pygame.K_q:
+                    running = False
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS:
+                    reset_run_state("MENU")
+                elif event.button in CONTROLLER_BACK_BUTTONS:
                     running = False
         # Affichage du fond spatial
         screen.fill(BLACK)
@@ -1302,16 +1606,20 @@ while running:
         screen.blit(score_font.render(f"Water: {water_ammo}", True, WHITE), (10, 50))
         screen.blit(score_font.render(f"Lives: {lives}", True, WHITE), (10, 90))
         # Afficher les options
-        r_surf = score_font.render("Press R to return to menu", True, GREEN)
-        q_surf = score_font.render("Press Q to quit", True, RED)
+        r_surf = score_font.render("Press R / A to return to menu", True, GREEN)
+        q_surf = score_font.render("Press Q / B to quit", True, RED)
         screen.blit(r_surf, r_surf.get_rect(center=(screen_width//2, screen_height//2 + 50)))
         screen.blit(q_surf, q_surf.get_rect(center=(screen_width//2, screen_height//2 + 100)))
-        pygame.display.flip()
+        draw_highscore_panel(screen_width - 316, 16, max_rows=4)
+        present_frame()
         continue
 
     # === Écran victoire finale ===
     if game_state == "FINAL_WIN":
+        if not run_recorded:
+            record_run_result("WIN", now)
         for event in pygame.event.get():
+            handle_global_event(event)
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
@@ -1320,6 +1628,13 @@ while running:
                 elif event.key == pygame.K_SPACE:
                     reset_run_state("MENU")
                 elif event.key == pygame.K_q:
+                    running = False
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in CONTROLLER_CONFIRM_BUTTONS:
+                    reset_run_state("LEVEL_INTRO")
+                elif event.button == 2:
+                    reset_run_state("MENU")
+                elif event.button in CONTROLLER_BACK_BUTTONS:
                     running = False
 
         screen.fill(BLACK)
@@ -1335,28 +1650,37 @@ while running:
         yw_rect = youwin_image.get_rect(center=(screen_width//2, screen_height//2 - 10))
         screen.blit(youwin_image, yw_rect)
 
+        elapsed_seconds = max(0, (now - game_start_time - paused_time_accum) // 1000) if game_start_time else 0
         summary = subtitle_font.render(
-            f"Score final: {score} | Ingredients recuperes: {len(ingredients_collected)}",
+            f"Score final: {score} | Ingredients: {len(ingredients_collected)} | Temps: {format_duration(elapsed_seconds)}",
             True,
-            WHITE
+            WHITE,
         )
-        summary_rect = summary.get_rect(center=(screen_width//2, screen_height//2 + 120))
+        summary_rect = summary.get_rect(center=(screen_width//2, screen_height//2 + 112))
         screen.blit(summary, summary_rect)
 
-        replay_surf = score_font.render("R: rejouer", True, GREEN)
-        replay_rect = replay_surf.get_rect(center=(screen_width//2, screen_height//2 + 170))
+        credits_y = screen_height // 2 + 140
+        for idx, line in enumerate(credits_lines):
+            credit_surf = subtitle_font.render(line, True, CYAN if idx % 2 == 0 else WHITE)
+            credit_rect = credit_surf.get_rect(center=(screen_width // 2, credits_y + idx * 24))
+            screen.blit(credit_surf, credit_rect)
+
+        replay_surf = score_font.render("R/A: rejouer", True, GREEN)
+        replay_rect = replay_surf.get_rect(center=(screen_width//2, screen_height//2 + 260))
         screen.blit(replay_surf, replay_rect)
 
-        menu_surf = subtitle_font.render("SPACE: menu   Q: quitter", True, WHITE)
-        menu_rect = menu_surf.get_rect(center=(screen_width//2, screen_height//2 + 210))
+        menu_surf = subtitle_font.render("SPACE/X: menu   Q/B: quitter", True, WHITE)
+        menu_rect = menu_surf.get_rect(center=(screen_width//2, screen_height//2 + 300))
         screen.blit(menu_surf, menu_rect)
+        draw_highscore_panel(screen_width - 316, 16, max_rows=6)
 
-        pygame.display.flip()
+        present_frame()
         continue
 
     # === Écran JEU (PLAYING) ===
     # Gestion des événements
     for event in pygame.event.get():
+        handle_global_event(event)
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN:
@@ -1390,43 +1714,55 @@ while running:
                 play_sound(hyper_dash_sound)
             if event.key == pygame.K_SPACE:
                 current_time = pygame.time.get_ticks()
-                if current_time >= next_shot_allowed_time and water_ammo > 0:
-                    # Déterminer la direction du tir à partir des touches fléchées
-                    keys = pygame.key.get_pressed()
-                    dx = 0
-                    dy = 0
-                    if keys[pygame.K_LEFT]:
-                        dx -= 1
-                    if keys[pygame.K_RIGHT]:
-                        dx += 1
-                    if keys[pygame.K_UP]:
-                        dy -= 1
-                    if keys[pygame.K_DOWN]:
-                        dy += 1
-                    if dx == 0 and dy == 0:
-                        # Tirer dans la dernière direction de déplacement
-                        if astro_facing == "left":
-                            dx = -bullet_speed
-                            dy = 0
-                        elif astro_facing == "right":
-                            dx = bullet_speed
-                            dy = 0
-                        elif astro_facing == "up":
-                            dx = 0
-                            dy = -bullet_speed
-                        else:  # "down"
-                            dx = 0
-                            dy = bullet_speed
-                    mag = math.sqrt(dx*dx + dy*dy)
-                    dx = dx / mag * bullet_speed
-                    dy = dy / mag * bullet_speed
-                    # Positionner le tir au centre d'AstroPaws
-                    bullet_rect = pygame.Rect(astro_x + 25 - bullet_width//2, astro_y + 25 - bullet_height//2, bullet_width, bullet_height)
-                    bullet = {'rect': bullet_rect, 'dx': dx, 'dy': dy}
-                    bullet_list.append(bullet)
-                    next_shot_allowed_time = current_time + cooldown_time
-                    water_ammo -= 1
-                    play_sound(shoot_sound)
+                keys = pygame.key.get_pressed()
+                shot_x = 0.0
+                shot_y = 0.0
+                if keys[pygame.K_LEFT]:
+                    shot_x -= 1.0
+                if keys[pygame.K_RIGHT]:
+                    shot_x += 1.0
+                if keys[pygame.K_UP]:
+                    shot_y -= 1.0
+                if keys[pygame.K_DOWN]:
+                    shot_y += 1.0
+                if shot_x == 0.0 and shot_y == 0.0:
+                    shot_x, shot_y = facing_to_vector(astro_facing)
+                fire_player_bullet(shot_x, shot_y, current_time)
+        elif event.type == pygame.JOYBUTTONDOWN:
+            if event.button in CONTROLLER_PAUSE_BUTTONS:
+                pause_start_time = now
+                game_state = "PAUSE"
+                break
+            if event.button in CONTROLLER_SHIELD_BUTTONS and shield_charges > 0 and not shield_active:
+                shield_active = True
+                shield_start_time = now
+                shield_charges -= 1
+                create_explosion(astro_x + 40, astro_y + 40, color=BLUE, num_particles=20)
+            if event.button in CONTROLLER_HYPER_BUTTONS and hyper_charges > 0 and not hyper_active:
+                hyper_active = True
+                hyper_start_time = now
+                hyper_last_fx_time = now
+                hyper_charges -= 1
+                hyper_last_granted_time = now
+                hyper_inv_anim['active'] = True
+                hyper_inv_anim['start'] = now
+                create_explosion(astro_x + 40, astro_y + 40, color=YELLOW, num_particles=35)
+                dash_impulse = speed * 1.8
+                if astro_facing == "left":
+                    astro_vx -= dash_impulse
+                elif astro_facing == "right":
+                    astro_vx += dash_impulse
+                elif astro_facing == "up":
+                    astro_vy -= dash_impulse
+                else:
+                    astro_vy += dash_impulse
+                play_sound(hyper_dash_sound)
+            if event.button in CONTROLLER_SHOOT_BUTTONS:
+                current_time = pygame.time.get_ticks()
+                shot_x, shot_y = get_controller_move_vector()
+                if shot_x == 0.0 and shot_y == 0.0:
+                    shot_x, shot_y = facing_to_vector(astro_facing)
+                fire_player_bullet(shot_x, shot_y, current_time)
 
     # Gestion continue des touches (pour détecter plusieurs touches en même temps)
     keys = pygame.key.get_pressed()
@@ -1441,6 +1777,11 @@ while running:
         input_y -= 1.0
     if keys[pygame.K_DOWN]:
         input_y += 1.0
+    pad_x, pad_y = get_controller_move_vector()
+    input_x += pad_x
+    input_y += pad_y
+    input_x = max(-1.0, min(1.0, input_x))
+    input_y = max(-1.0, min(1.0, input_y))
     if input_x != 0 and input_y != 0:
         input_x *= 0.7071
         input_y *= 0.7071
@@ -1540,7 +1881,7 @@ while running:
 
     # Spawn d'ennemis selon configuration du niveau
     level_conf = levels.levels[level_idx]
-    spawn_chance = 0.02
+    spawn_chance = get_level_spawn_chance(level_idx, score, lives, boss_active)
     if not boss_active and random.random() < spawn_chance:
         # Choisir le type en fonction des poids du niveau
         spawn_weights = level_conf['spawn_weights']
@@ -1689,6 +2030,7 @@ while running:
         astro_vy = 0.0
         astro_move_dx = 0.0
         astro_move_dy = 0.0
+        record_run_result("WIN", now)
         game_state = "FINAL_WIN"
         continue
 
@@ -1726,7 +2068,7 @@ while running:
                 play_sound(explosion_sound)
                 lost_life_surface = score_font.render("Vous avez perdu une vie!", True, WHITE)
                 screen.blit(lost_life_surface, (screen_width//2 - 100, screen_height//2))
-                pygame.display.flip()
+                present_frame()
                 pygame.time.delay(1000)
             elif enemy['type'] == "rat":
                 score -= 10
@@ -1785,6 +2127,7 @@ while running:
     # Vérifier Game Over: si les vies tombent à 0
     if lives <= 0:
         # Passer en écran de Game Over
+        record_run_result("KO", now)
         game_state = "GAME_OVER"
         continue
 
@@ -1892,7 +2235,7 @@ while running:
             screen.blit(anim_img, rect)
             # message
             screen.blit(msg, msg_rect)
-            pygame.display.flip()
+            present_frame()
             clock.tick(60)
         # Animer l'ajout de l'ingrédient
         ingredients_collected.append(levels.levels[level_idx]['end_item'])
@@ -1950,7 +2293,7 @@ while running:
             water_item_list.remove(item)
     
     # Apparition de nouvelles réserves d'eau
-    water_spawn_chance = 0.01 if boss_active else 0.005
+    water_spawn_chance = get_water_pickup_spawn_chance(level_idx, boss_active, water_ammo)
     if random.random() < water_spawn_chance:
         x = random.randint(0, screen_width - 10)
         y = random.randint(0, screen_height - 10)
@@ -2232,7 +2575,7 @@ while running:
     screen.blit(lvl_surf, lvl_rect)
 
     # Actualiser l'affichage
-    pygame.display.flip()
+    present_frame()
 
 # Quitter Pygame proprement
 pygame.quit()
