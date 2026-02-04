@@ -17,7 +17,7 @@ Dans les confins lointains de la galaxie, la légendaire Pâtée Galactique™ a
 Votre mission consiste à :
 - Atteindre le score requis pour compléter chaque niveau.
 - Ramasser un ingrédient sacré à la fin de chaque secteur.
-- Affronter et vaincre l'Impératrice Zibeline, terrible Boss Final qui convoite votre festin cosmique, pour obtenir le dernier ingrédient : le Fragment de Croquette Originelle.
+- Préparer l'affrontement final contre l'Impératrice Zibeline (boss et 4e ingrédient prévus dans les prochaines versions).
 
 ---
 
@@ -27,7 +27,7 @@ Votre mission consiste à :
 - **Tir (Jet d’eau) :** Barre Espace (consomme 1L d’eau).
 - **Pause :** Touche P (reprendre/quitter).
 - **Bouclier :** Touche H (invincibilité temporaire).
-- **Hyperdrive (Dash) :** Touche J (accélération rapide).
+- **Hyperdrive (Dash) :** Touche J (consomme 1 charge, boost x3, invincibilité courte).
 - **Menu Info :** Touche I.
 - **Menu Histoire :** Touche S.
 - **Quitter :** Touche Q (dans les menus).
@@ -53,9 +53,9 @@ Votre mission consiste à :
 - **Souris Mutantes** : Rapides et nombreuses, elles cherchent à grignoter tout ce qu'elles trouvent !
 - **Rats Radioactifs** : Plus dangereux que les souris, ils infligent davantage de dégâts.
 - **Chiens d'la Casse de l'Espace** : Robustes et tenaces, capables de vous faire perdre des vies !
-- **Impératrice Zibeline** : Boss Final, agile et redoutable. Surgit des ombres de l’espace pour s’emparer du précieux festin cosmique.
+- **Impératrice Zibeline** : Boss final prévu dans une prochaine version.
 
-🌌 « L’Impératrice Zibeline surgit des ombres de l’espace… et elle convoite ton précieux festin cosmique ! »
+🌌 « L’Impératrice Zibeline surgira bientôt des ombres de l’espace… »
 
 ---
 

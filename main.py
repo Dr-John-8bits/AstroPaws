@@ -3,6 +3,7 @@ import sys
 import random
 import math
 import textwrap
+from pathlib import Path
 
 # Importer la configuration des niveaux
 import levels
@@ -18,6 +19,15 @@ screen_height = 600
 screen = pygame.display.set_mode((screen_width, screen_height))
 pygame.display.set_caption("AstroPaws")
 
+# Audio optionnel : le jeu reste jouable même sans périphérique audio.
+try:
+    pygame.mixer.init()
+except pygame.error:
+    pass
+
+ROOT_DIR = Path(__file__).resolve().parent
+SOUND_DIR = ROOT_DIR / "sounds"
+
 # Définition de quelques couleurs
 BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
@@ -28,6 +38,44 @@ YELLOW = (255, 255, 0)
 GREEN = (0, 255, 0)
 RED   = (255, 0, 0)
 CYAN  = (0, 255, 255)
+
+GAME_VERSION = "2026-02-04.1"
+
+INITIAL_LIVES = 9
+INITIAL_WATER_AMMO = 50
+INITIAL_CROQUETTES = 5
+HYPER_DASH_MULTIPLIER = 3
+HYPER_DASH_DURATION = 450
+HYPER_PICKUP_LIFETIME = 7000
+HYPER_PICKUP_SPAWN_CHANCE = 0.003
+ASTRO_HIT_FLASH_DURATION = 220
+ASTRO_ACCEL = 0.85
+ASTRO_FRICTION = 0.82
+ASTRO_DRAG = 0.98
+
+GRAVITY_RADIUS = 220
+GRAVITY_LEVEL_STRENGTH = {
+    0: 0.0,
+    1: 0.12,
+    2: 0.18,
+}
+
+OXIDIZED_FROM_LEVEL = 1
+OXIDIZED_DELAY_MS = 3200
+OXIDIZED_BONUS_SCORE = 12
+OXIDIZED_WATER_PENALTY = 4
+OXIDIZED_DEBUFF_DURATION = 1800
+
+BOSS_MAX_HEALTH = 72
+
+# Le cooldown est récupéré depuis la config de niveau si disponible.
+hyper_level_cfg = next(
+    (cfg for cfg in levels.levels if cfg.get("item", {}).get("type") == "hyperdrive"),
+    None
+)
+HYPER_COOLDOWN = (
+    hyper_level_cfg.get("item", {}).get("cooldown", 60000) if hyper_level_cfg else 60000
+)
 
 # Ajout des listes pour les ennemis et explosions
 enemy_list = []
@@ -42,9 +90,361 @@ def create_explosion(x, y, color=YELLOW, num_particles=20):
         lifetime = random.randint(20, 40)
         explosion_list.append({'x': x, 'y': y, 'dx': dx, 'dy': dy, 'lifetime': lifetime, 'color': color})
 
+def get_enemy_base_sprite(enemy_type):
+    if enemy_type == "mouse":
+        return mouse_sprite
+    if enemy_type == "rat":
+        return rat_sprite
+    return dog_sprite
+
+def draw_thruster(center_x, center_y, facing, thrust_power, hyper_on):
+    if thrust_power <= 0:
+        return
+    direction = {
+        "left": (-1, 0),
+        "right": (1, 0),
+        "up": (0, -1),
+        "down": (0, 1),
+    }.get(facing, (1, 0))
+    dir_x, dir_y = direction
+    back_x, back_y = -dir_x, -dir_y
+    side_x, side_y = -back_y, back_x
+    layers = 4 if hyper_on else 3
+    for i in range(layers):
+        spread = (i - 1.5) * (3 + 2 * thrust_power)
+        jitter = random.uniform(-2.0, 2.0)
+        distance = 28 + i * 7 + 10 * thrust_power
+        px = center_x + back_x * distance + side_x * spread
+        py = center_y + back_y * distance + side_y * spread + jitter
+        radius = max(1, int(4 + thrust_power * 5 - i))
+        color = YELLOW if i == 0 else ORANGE if i == 1 else (255, 120, 0)
+        pygame.draw.circle(screen, color, (int(px), int(py)), radius)
+
+def draw_enemy_animated(enemy, now_ms):
+    base_sprite = get_enemy_base_sprite(enemy['type'])
+    phase = enemy.get('anim_phase', enemy.get('bob_phase', 0.0))
+
+    if enemy['type'] == "mouse":
+        bob = math.sin(now_ms / 130 + phase) * 8 + math.sin(now_ms / 45 + phase) * 3
+        stretch = math.sin(now_ms / 85 + phase)
+        scale_x = 1.0 + 0.12 * stretch
+        scale_y = 1.0 - 0.10 * stretch
+        angle = 8 * math.sin(now_ms / 90 + phase)
+    elif enemy['type'] == "rat":
+        bob = math.sin(now_ms / 170 + phase) * 10
+        stretch = math.sin(now_ms / 120 + phase)
+        scale_x = 1.0 + 0.08 * stretch
+        scale_y = 1.0 - 0.05 * stretch
+        angle = 5 * math.sin(now_ms / 150 + phase)
+    else:  # dog
+        bob = math.sin(now_ms / 220 + phase) * 12
+        stretch = math.sin(now_ms / 180 + phase)
+        scale_x = 1.0 + 0.04 * stretch
+        scale_y = 1.0 + 0.05 * stretch
+        angle = 3 * math.sin(now_ms / 200 + phase)
+
+    spawn_time = enemy.get('spawn_time', now_ms)
+    appear_ratio = min(1.0, max(0.0, (now_ms - spawn_time) / 260))
+    appear_scale = 0.75 + 0.25 * appear_ratio
+    scale_x *= appear_scale
+    scale_y *= appear_scale
+
+    animated = pygame.transform.rotozoom(base_sprite, angle, 1.0)
+    w = max(1, int(animated.get_width() * scale_x))
+    h = max(1, int(animated.get_height() * scale_y))
+    animated = pygame.transform.smoothscale(animated, (w, h))
+    animated.set_alpha(int(255 * appear_ratio))
+
+    shadow_w = max(6, int(enemy['width'] * (0.85 + 0.08 * math.sin(now_ms / 160 + phase))))
+    shadow_h = 8 if enemy['type'] == "dog" else 6
+    shadow_rect = pygame.Rect(0, 0, shadow_w, shadow_h)
+    shadow_rect.center = (
+        int(enemy['x'] + enemy['width'] / 2),
+        int(enemy['y'] + enemy['height'] + 10),
+    )
+    pygame.draw.ellipse(screen, (18, 18, 26), shadow_rect)
+
+    rect = animated.get_rect(
+        center=(enemy['x'] + enemy['width'] / 2, enemy['y'] + enemy['height'] / 2 + bob)
+    )
+    screen.blit(animated, rect)
+
+def draw_astro_animated(now_ms, astro_pos_x, astro_pos_y, facing, move_dx, move_dy, hyper_on, hit_flash_until):
+    base = {
+        "left": astro_sprite_left,
+        "right": astro_sprite_right,
+        "up": astro_sprite_up,
+        "down": astro_sprite_down,
+    }.get(facing, astro_sprite_right)
+
+    move_speed = math.hypot(move_dx, move_dy)
+    max_speed = speed * HYPER_DASH_MULTIPLIER
+    speed_ratio = min(1.0, move_speed / max(1.0, max_speed))
+    moving = move_speed > 0.1
+
+    breathe = 1.0 + 0.03 * math.sin(now_ms / 280)
+    stride = math.sin(now_ms / 85) if moving else math.sin(now_ms / 220)
+    scale_x = breathe * (1.0 + 0.06 * abs(stride))
+    scale_y = breathe * (1.0 - 0.04 * abs(stride))
+    if hyper_on:
+        scale_x += 0.10
+        scale_y += 0.04
+
+    if facing in ("left", "right"):
+        angle = -7.0 * (move_dy / max(1.0, speed))
+    else:
+        angle = 7.0 * (move_dx / max(1.0, speed))
+    angle += 2.5 * math.sin(now_ms / 180) * speed_ratio
+
+    animated = pygame.transform.rotozoom(base, angle, 1.0)
+    w = max(1, int(animated.get_width() * scale_x))
+    h = max(1, int(animated.get_height() * scale_y))
+    animated = pygame.transform.smoothscale(animated, (w, h))
+
+    center_x = astro_pos_x + astro_sprite_right.get_width() // 2
+    center_y = astro_pos_y + astro_sprite_right.get_height() // 2
+    rect = animated.get_rect(center=(center_x, center_y))
+
+    thrust_power = 0.0
+    if moving:
+        thrust_power = min(1.0, 0.25 + speed_ratio)
+    if hyper_on:
+        thrust_power = 1.0
+    if thrust_power > 0.0:
+        draw_thruster(center_x, center_y, facing, thrust_power, hyper_on)
+
+    screen.blit(animated, rect)
+
+    if now_ms < hit_flash_until:
+        flash = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+        flash.fill((255, 50, 50, 90))
+        screen.blit(flash, rect.topleft)
+
+    return rect
+
+def make_oxidized_variant(sprite):
+    variant = sprite.copy()
+    tint = pygame.Surface(sprite.get_size(), pygame.SRCALPHA)
+    tint.fill((130, 190, 90, 175))
+    variant.blit(tint, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    return variant
+
+def get_level_gravity_strength(level_index):
+    return GRAVITY_LEVEL_STRENGTH.get(level_index, 0.0)
+
+def compute_planet_gravity_pull(player_cx, player_cy, level_index):
+    gravity_strength = get_level_gravity_strength(level_index)
+    if gravity_strength <= 0:
+        return 0.0, 0.0, None, 0.0
+
+    best_dx = 0.0
+    best_dy = 0.0
+    best_planet = None
+    best_pull = 0.0
+    for planet in planet_list:
+        dx = planet['x'] - player_cx
+        dy = planet['y'] - player_cy
+        dist = math.hypot(dx, dy)
+        if dist <= 2 or dist >= GRAVITY_RADIUS:
+            continue
+        influence = 1.0 - (dist / GRAVITY_RADIUS)
+        pull_strength = gravity_strength * influence * (0.8 + planet['size'] / 22)
+        if pull_strength > best_pull:
+            best_pull = pull_strength
+            best_dx = (dx / dist) * pull_strength
+            best_dy = (dy / dist) * pull_strength
+            best_planet = planet
+
+    return best_dx, best_dy, best_planet, best_pull
+
+def is_croquette_oxidized(croquette, level_index, now_ms):
+    if level_index < OXIDIZED_FROM_LEVEL:
+        return False
+    return (now_ms - croquette['spawn_time']) >= OXIDIZED_DELAY_MS
+
+def spawn_boss_projectiles(now_ms, player_center):
+    global boss_data, boss_projectiles
+
+    if not boss_active or not boss_data:
+        return
+
+    phase = boss_data['phase']
+    base_x = boss_data['x'] + boss_data['width'] // 2
+    base_y = boss_data['y'] + boss_data['height'] - 8
+    target_angle = math.atan2(player_center[1] - base_y, player_center[0] - base_x)
+
+    spread_by_phase = {
+        1: [0.0],
+        2: [-0.20, 0.0, 0.20],
+        3: [-0.40, -0.20, 0.0, 0.20, 0.40],
+    }
+    speed_by_phase = {1: 4.2, 2: 4.8, 3: 5.4}
+    radius_by_phase = {1: 5, 2: 6, 3: 7}
+    color_by_phase = {1: ORANGE, 2: RED, 3: (255, 60, 120)}
+
+    for spread in spread_by_phase[phase]:
+        angle = target_angle + spread
+        speed = speed_by_phase[phase]
+        boss_projectiles.append({
+            'x': base_x,
+            'y': base_y,
+            'dx': math.cos(angle) * speed,
+            'dy': math.sin(angle) * speed,
+            'radius': radius_by_phase[phase],
+            'color': color_by_phase[phase],
+            'lifetime': 220,
+        })
+
+    if phase == 3:
+        # Rafale latérale pour mettre la pression en phase finale.
+        for side_x, drift in ((40, 1.6), (screen_width - 40, -1.6)):
+            boss_projectiles.append({
+                'x': side_x,
+                'y': boss_data['y'] + boss_data['height'] // 2,
+                'dx': drift,
+                'dy': 4.4,
+                'radius': 6,
+                'color': (255, 80, 140),
+                'lifetime': 190,
+            })
+
+    boss_data['last_shot'] = now_ms
+
+def draw_boss(now_ms):
+    if not boss_active or not boss_data:
+        return None
+
+    pulse = 1.0 + 0.03 * math.sin(now_ms / 160)
+    angle = 3.0 * math.sin(now_ms / 250)
+
+    base_sprite = pygame.transform.smoothscale(
+        dog_sprite, (boss_data['width'], boss_data['height'])
+    )
+    animated = pygame.transform.rotozoom(base_sprite, angle, pulse)
+    boss_rect = animated.get_rect(
+        center=(
+            boss_data['x'] + boss_data['width'] // 2,
+            boss_data['y'] + boss_data['height'] // 2,
+        )
+    )
+
+    shadow_rect = pygame.Rect(0, 0, int(boss_data['width'] * 0.8), 16)
+    shadow_rect.center = (
+        boss_data['x'] + boss_data['width'] // 2,
+        boss_data['y'] + boss_data['height'] + 14,
+    )
+    pygame.draw.ellipse(screen, (20, 10, 20), shadow_rect)
+    screen.blit(animated, boss_rect)
+
+    # Couronne impériale minimaliste.
+    crown_center_x = boss_rect.centerx
+    crown_y = boss_rect.top - 14
+    crown_points = [
+        (crown_center_x - 26, crown_y + 18),
+        (crown_center_x - 12, crown_y + 2),
+        (crown_center_x, crown_y + 16),
+        (crown_center_x + 12, crown_y + 2),
+        (crown_center_x + 26, crown_y + 18),
+    ]
+    pygame.draw.polygon(screen, GOLD, crown_points)
+    pygame.draw.circle(screen, YELLOW, (crown_center_x, crown_y + 4), 3)
+
+    eye_color = RED if boss_data['phase'] >= 2 else ORANGE
+    pygame.draw.circle(screen, eye_color, (boss_rect.centerx - 18, boss_rect.centery - 8), 4)
+    pygame.draw.circle(screen, eye_color, (boss_rect.centerx + 18, boss_rect.centery - 8), 4)
+
+    return pygame.Rect(boss_data['x'], boss_data['y'], boss_data['width'], boss_data['height'])
+
+def start_boss_fight(now_ms):
+    global boss_active, boss_data, boss_projectiles, boss_contact_cooldown_until, game_state
+
+    boss_active = True
+    boss_data = {
+        'name': "Imperatrice Zibeline",
+        'x': screen_width // 2 - 90,
+        'y': 90,
+        'width': 180,
+        'height': 120,
+        'health': BOSS_MAX_HEALTH,
+        'max_health': BOSS_MAX_HEALTH,
+        'phase': 1,
+        'vx': 1,
+        'last_shot': now_ms,
+        'seed': random.uniform(0, math.pi * 2),
+    }
+    boss_projectiles = []
+    boss_contact_cooldown_until = 0
+    game_state = "BOSS_INTRO"
+
+def load_sound(filename, volume=0.6):
+    if not pygame.mixer.get_init():
+        return None
+    sound_path = SOUND_DIR / filename
+    if not sound_path.exists():
+        return None
+    try:
+        sound = pygame.mixer.Sound(str(sound_path))
+        sound.set_volume(volume)
+        return sound
+    except pygame.error:
+        return None
+
+def play_sound(sound):
+    if sound is None:
+        return
+    try:
+        sound.play()
+    except pygame.error:
+        pass
+
+music_tracks = {
+    "menu": SOUND_DIR / "music_menu_loop.wav",
+    "gameplay": SOUND_DIR / "music_gameplay_loop.wav",
+}
+current_music_key = None
+
+def set_music(music_key):
+    global current_music_key
+    if current_music_key == music_key:
+        return
+    current_music_key = music_key
+    if not pygame.mixer.get_init():
+        return
+    if music_key is None:
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+        return
+    music_path = music_tracks.get(music_key)
+    if music_path is None or not music_path.exists():
+        return
+    try:
+        pygame.mixer.music.load(str(music_path))
+        pygame.mixer.music.set_volume(0.35 if music_key == "menu" else 0.45)
+        pygame.mixer.music.play(-1)
+    except pygame.error:
+        pass
+
+def music_for_state(state):
+    if state in ("MENU", "STORY", "INFO", "FINAL_WIN", "GAME_OVER"):
+        return "menu"
+    if state in ("PLAYING", "PAUSE", "LEVEL_INTRO", "BOSS_INTRO", "REWARD"):
+        return "gameplay"
+    return None
+
+# SFX 8-bit chargés depuis le pack généré.
+shoot_sound = load_sound("sfx_shoot.wav", 0.45)
+explosion_sound = load_sound("sfx_explosion.wav", 0.50)
+pickup_sound = load_sound("sfx_pickup.wav", 0.45)
+hyper_pickup_sound = load_sound("sfx_pickup.wav", 0.55)
+hyper_dash_sound = load_sound("sfx_dash.wav", 0.60)
+warp_sound = load_sound("sfx_warp.wav", 0.55)
+
 # Effet de warp d'étoiles suivi d'un flash blanc
 def warp_effect():
     # Tunnel d'étoiles puis flash blanc
+    play_sound(warp_sound)
     center_x, center_y = screen_width // 2, screen_height // 2
     # Effet warp encore plus dense et plus lent
     for _ in range(30):  # plus d'étapes pour densifier
@@ -78,19 +478,19 @@ def warp_effect():
 
 croquette_size = 10
 croquette_lifetime = 5000  # Durée de vie en millisecondes (5 secondes)
-croquette_list = []
-for i in range(5):
+
+def spawn_croquette():
     x = random.randint(0, screen_width - croquette_size)
     y = random.randint(0, screen_height - croquette_size)
     spawn_time = pygame.time.get_ticks()
-    if random.random() < 0.1:
-        croquette_type = "rare"
-    else:
-        croquette_type = "normal"
-    croquette_list.append({'x': x, 'y': y, 'spawn_time': spawn_time, 'type': croquette_type})
+    croquette_type = "rare" if random.random() < 0.1 else "normal"
+    return {'x': x, 'y': y, 'spawn_time': spawn_time, 'type': croquette_type}
+
+croquette_list = [spawn_croquette() for _ in range(INITIAL_CROQUETTES)]
 
 # Création des réserves d'eau (objets à collecter pour augmenter l'eau)
 water_item_list = []
+hyper_item_list = []
 
 # Génération d'un fond spatial procédural
 num_stars = 50
@@ -177,6 +577,8 @@ brown_croquette_sprite = pygame.transform.scale(brown_croquette_sprite, (30, 30)
 # Agrandir la croquette dorée
 gold_croquette_sprite  = pygame.image.load("images/goldcroquette.png").convert_alpha()
 gold_croquette_sprite  = pygame.transform.scale(gold_croquette_sprite,  (40, 40))  # croquette rare encore plus grande
+brown_croquette_oxidized_sprite = make_oxidized_variant(brown_croquette_sprite)
+gold_croquette_oxidized_sprite = make_oxidized_variant(gold_croquette_sprite)
 # Agrandir la réserve d'eau
 water_sprite           = pygame.image.load("images/water.png").convert_alpha()
 water_sprite           = pygame.transform.scale(water_sprite,           (30, 30))
@@ -232,6 +634,7 @@ shield_icon = pygame.image.load("images/shield_icon.png").convert_alpha()
 shield_icon = pygame.transform.scale(shield_icon, (48, 48))
 hyper_icon  = pygame.image.load("images/hyper_icon.png").convert_alpha()
 hyper_icon  = pygame.transform.scale(hyper_icon,  (48, 48))
+hyper_pickup_sprite = pygame.transform.scale(hyper_icon, (30, 30))
 
 ingredient_icon = pygame.image.load("images/ingredient_icon.png").convert_alpha()
 ingredient_icon = pygame.transform.scale(ingredient_icon, (48, 48))
@@ -267,8 +670,8 @@ bullet_height = 4
 
 # Initialiser le score, les vies et le font
 score = 0
-lives = 9
-water_ammo = 10
+lives = INITIAL_LIVES
+water_ammo = INITIAL_WATER_AMMO
 pygame.font.init()
 # Augmentation de la taille de la police pour une meilleure lisibilité
 score_font = pygame.font.SysFont(None, 48)
@@ -344,24 +747,108 @@ shield_cooldown = 30000         # 30 secondes de recharge
 # Animation clignotante pour bouclier dans l'inventaire
 shield_inv_anim = {'active': False, 'start': 0, 'duration': 1000}  # 1 seconde
 hyper_charges = 0               # charges d'hyperespace
+hyper_active = False
+hyper_start_time = None
+hyper_last_granted_time = None
+hyper_unlocked = False
+hyper_inv_anim = {'active': False, 'start': 0, 'duration': 1000}
+hyper_last_fx_time = 0
+astro_vx = 0.0
+astro_vy = 0.0
+astro_move_dx = 0.0
+astro_move_dy = 0.0
+astro_hit_flash_until = 0
+oxidized_debuff_until = 0
+gravity_pull_strength = 0.0
+gravity_pull_planet = None
+boss_active = False
+boss_defeated = False
+boss_data = {}
+boss_projectiles = []
+boss_contact_cooldown_until = 0
 ingredients_collected = []      # liste des ingrédients collectés
 ing_anim_active = False  # indique qu'un nouvel ingrédient doit être animé
 ing_anim_start = 0       # timestamp du début de l'animation
 ing_anim_duration = 1500  # durée de l'animation en ms
 paused_time_accum = 0       # temps total passé en pause (ms)
 pause_start_time = None     # timestamp du début de la pause
-level_win_start_time = None  # timestamp du début de l'écran LEVEL_WIN
+
+def reset_run_state(start_state="LEVEL_INTRO"):
+    global astro_x, astro_y, astro_facing, astro_vx, astro_vy, astro_move_dx, astro_move_dy, astro_hit_flash_until
+    global score, lives, water_ammo
+    global game_start_time, reward_shown
+    global shield_charges, shield_active, shield_start_time, shield_last_granted_time
+    global hyper_charges, hyper_active, hyper_start_time, hyper_last_granted_time
+    global hyper_unlocked, hyper_inv_anim, hyper_last_fx_time, oxidized_debuff_until
+    global gravity_pull_strength, gravity_pull_planet
+    global boss_active, boss_defeated, boss_data, boss_projectiles, boss_contact_cooldown_until
+    global ingredients_collected, ing_anim_active, ing_anim_start
+    global paused_time_accum, pause_start_time, level_idx, game_state, next_shot_allowed_time
+    global enemy_list, explosion_list, bullet_list, water_item_list, hyper_item_list, croquette_list
+
+    astro_x = screen_width // 2
+    astro_y = screen_height // 2
+    astro_facing = "right"
+    astro_vx = 0.0
+    astro_vy = 0.0
+    astro_move_dx = 0.0
+    astro_move_dy = 0.0
+    astro_hit_flash_until = 0
+
+    score = 0
+    lives = INITIAL_LIVES
+    water_ammo = INITIAL_WATER_AMMO
+    level_idx = 0
+    next_shot_allowed_time = 0
+
+    game_start_time = None
+    reward_shown = False
+    shield_charges = 0
+    shield_active = False
+    shield_start_time = None
+    shield_last_granted_time = None
+    hyper_charges = 0
+    hyper_active = False
+    hyper_start_time = None
+    hyper_last_granted_time = None
+    hyper_unlocked = False
+    hyper_inv_anim = {'active': False, 'start': 0, 'duration': 1000}
+    hyper_last_fx_time = 0
+    oxidized_debuff_until = 0
+    gravity_pull_strength = 0.0
+    gravity_pull_planet = None
+    boss_active = False
+    boss_defeated = False
+    boss_data = {}
+    boss_projectiles = []
+    boss_contact_cooldown_until = 0
+    ingredients_collected = []
+    ing_anim_active = False
+    ing_anim_start = 0
+    paused_time_accum = 0
+    pause_start_time = None
+
+    enemy_list.clear()
+    explosion_list.clear()
+    bullet_list.clear()
+    water_item_list.clear()
+    hyper_item_list.clear()
+    croquette_list = [spawn_croquette() for _ in range(INITIAL_CROQUETTES)]
+
+    game_state = start_state
+
 now = 0
 while running:
     # Limiter le jeu à 60 images par seconde
     clock.tick(60)
     # Temps courant
     now = pygame.time.get_ticks()
+    set_music(music_for_state(game_state))
     # Initialiser le chronomètre au début du jeu
     if game_state == "PLAYING" and game_start_time is None:
         game_start_time = now
     # Déclencher la récompense à 30 secondes
-    if game_state == "PLAYING" and not reward_shown and game_start_time is not None and now - game_start_time >= 30000:
+    if game_state == "PLAYING" and not boss_active and not reward_shown and game_start_time is not None and now - game_start_time >= 30000:
         game_state = "REWARD"
         continue
     # Recharge automatique du bouclier toutes les shield_cooldown ms
@@ -371,6 +858,15 @@ while running:
         # Animer l'icône de bouclier dans l'inventaire
         shield_inv_anim['active'] = True
         shield_inv_anim['start'] = now
+    # Fin du dash Hyperdrive
+    if game_state == "PLAYING" and hyper_active and hyper_start_time is not None and now - hyper_start_time >= HYPER_DASH_DURATION:
+        hyper_active = False
+    # Recharge automatique de l'Hyperdrive après déblocage
+    if game_state == "PLAYING" and hyper_unlocked and hyper_last_granted_time is not None and now - hyper_last_granted_time >= HYPER_COOLDOWN:
+        hyper_charges += 1
+        hyper_last_granted_time = now
+        hyper_inv_anim['active'] = True
+        hyper_inv_anim['start'] = now
 
     # === Écran INFO ===
     if game_state == "INFO":
@@ -395,13 +891,14 @@ while running:
             (heart_sprite,  "Vie : perdre 1 vie si touché par un chien."),
             (water_sprite,  "Eau : -1L par tir, ramasse bidon pour +10L."),
             (shield_icon,   "Bouclier (H) : 5s de protection, cooldown 30s."),
-            (hyper_icon,    "Hyperdrive (J) : dash en avant. WIP"),
+            (hyper_icon,    "Hyperdrive (J) : dash x3, invincibilité brève, cooldown 60s."),
             (ingredient_icon, "Ingrédient : collecte pour pâtée cosmique."),
             ((brown_croquette_sprite, gold_croquette_sprite), "Croquettes : +3pts (marron), +10pts (dorée)."),
             (mouse_sprite,  "Souris : 1 tir pour tuer, +10pts, collision -5pts."),
             (rat_sprite,    "Rat : 1 tir pour tuer, +20pts, collision -10pts."),
             (dog_sprite,    "Chien : 3 tirs pour tuer, +30pts, collision -1 vie."),
-            (None,          f"Score requis : {levels.levels[0]['target_score']} -> N2, {levels.levels[1]['target_score']}-> N3, {levels.levels[2]['target_score']}-> Fin")
+            (None,          f"Score requis : {levels.levels[0]['target_score']} -> N2, {levels.levels[1]['target_score']}-> N3, {levels.levels[2]['target_score']}-> Boss"),
+            (None,          "N2+: gravite locale et croquettes oxydees (risque/recompense).")
         ]
         # Affichage
         y = 60
@@ -497,9 +994,7 @@ while running:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
-                    # Aller à l'écran d'intro du niveau 1
-                    level_idx = 0
-                    game_state = "LEVEL_INTRO"
+                    reset_run_state("LEVEL_INTRO")
                 elif event.key == pygame.K_s:
                     story_scroll_y = float(screen_height)
                     game_state = "STORY"
@@ -549,7 +1044,7 @@ while running:
         prompt4_rect = prompt4.get_rect(center=(screen_width//2, prompt_y_base + 120))
         screen.blit(prompt4, prompt4_rect)
         # Affichage de la version (date.build) en bas à droite du menu
-        version_surf = subtitle_font.render("Version 2025-05-25.1", True, WHITE)
+        version_surf = subtitle_font.render(f"Version {GAME_VERSION}", True, WHITE)
         version_rect = version_surf.get_rect(bottomright=(screen_width - 10, screen_height - 10))
         screen.blit(version_surf, version_rect)
         pygame.display.flip()
@@ -623,6 +1118,50 @@ while running:
 
         # Poursuivre
         cont_surf = score_font.render("Press C to continue", True, GREEN)
+        cont_rect = cont_surf.get_rect(center=(screen_width//2, screen_height - 50))
+        screen.blit(cont_surf, cont_rect)
+        pygame.display.flip()
+        continue
+
+    # === Écran BOSS_INTRO ===
+    if game_state == "BOSS_INTRO":
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_c:
+                    warp_effect()
+                    game_state = "PLAYING"
+                elif event.key == pygame.K_q:
+                    running = False
+
+        screen.fill(BLACK)
+        for star in star_list:
+            pygame.draw.circle(screen, WHITE, (int(star['x']), int(star['y'])), 1)
+        for planet in planet_list:
+            pygame.draw.circle(screen, planet['color'], (int(planet['x']), int(planet['y'])), planet['size'])
+
+        title = score_font.render("ALERTE BOSS FINAL", True, RED)
+        title_rect = title.get_rect(center=(screen_width // 2, 60))
+        screen.blit(title, title_rect)
+
+        boss_name = score_font.render("Imperatrice Zibeline", True, GOLD)
+        boss_name_rect = boss_name.get_rect(center=(screen_width // 2, 110))
+        screen.blit(boss_name, boss_name_rect)
+
+        boss_preview = pygame.transform.smoothscale(dog_sprite, (180, 120))
+        preview_rect = boss_preview.get_rect(center=(screen_width // 2, 240))
+        screen.blit(boss_preview, preview_rect)
+        pygame.draw.circle(screen, GOLD, (preview_rect.centerx, preview_rect.top - 8), 6)
+
+        line1 = subtitle_font.render("Phases evolutives et rafales toxiques.", True, WHITE)
+        line2 = subtitle_font.render("Survis, esquive, puis acheve-la au jet d'eau.", True, WHITE)
+        line3 = subtitle_font.render("Dernier ingredient a gagner: Fragment Cosmique.", True, CYAN)
+        screen.blit(line1, line1.get_rect(center=(screen_width // 2, 360)))
+        screen.blit(line2, line2.get_rect(center=(screen_width // 2, 394)))
+        screen.blit(line3, line3.get_rect(center=(screen_width // 2, 428)))
+
+        cont_surf = score_font.render("Press C to engage", True, GREEN)
         cont_rect = cont_surf.get_rect(center=(screen_width//2, screen_height - 50))
         screen.blit(cont_surf, cont_rect)
         pygame.display.flip()
@@ -704,7 +1243,8 @@ while running:
         screen.blit(shield_count, (inv_x + shield_icon.get_width() + 10, inv_y + 12))
         # Hyperdrive
         screen.blit(hyper_icon, (inv_x + 120, inv_y))
-        hyper_count = score_font.render(f"x{hyper_charges}", True, WHITE)
+        hyper_color = YELLOW if hyper_active or (hyper_inv_anim['active'] and ((now - hyper_inv_anim['start']) // 250) % 2 == 0) else WHITE
+        hyper_count = score_font.render(f"x{hyper_charges}", True, hyper_color)
         screen.blit(hyper_count, (inv_x + 120 + hyper_icon.get_width() + 10, inv_y + 12))
         # Ingrédients collectés : icône générique + sprites spécifiques clignotants
         base_x = inv_x + 240
@@ -745,25 +1285,7 @@ while running:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_r:
-                    # Réinitialiser le jeu
-                    score = 0
-                    lives = 9
-                    water_ammo = 50
-                    astro_x = screen_width // 2
-                    astro_y = screen_height // 2
-                    enemy_list.clear()
-                    explosion_list.clear()
-                    bullet_list.clear()
-                    water_item_list.clear()
-                    croquette_list.clear()
-                    # Recréer quelques croquettes initiales
-                    for i in range(5):
-                        x = random.randint(0, screen_width - croquette_size)
-                        y = random.randint(0, screen_height - croquette_size)
-                        spawn_time = pygame.time.get_ticks()
-                        croquette_type = "rare" if random.random() < 0.1 else "normal"
-                        croquette_list.append({'x': x, 'y': y, 'spawn_time': spawn_time, 'type': croquette_type})
-                    game_state = "MENU"
+                    reset_run_state("MENU")
                 elif event.key == pygame.K_q:
                     running = False
         # Affichage du fond spatial
@@ -787,6 +1309,51 @@ while running:
         pygame.display.flip()
         continue
 
+    # === Écran victoire finale ===
+    if game_state == "FINAL_WIN":
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r:
+                    reset_run_state("LEVEL_INTRO")
+                elif event.key == pygame.K_SPACE:
+                    reset_run_state("MENU")
+                elif event.key == pygame.K_q:
+                    running = False
+
+        screen.fill(BLACK)
+        for star in star_list:
+            pygame.draw.circle(screen, WHITE, (int(star['x']), int(star['y'])), 1)
+        for planet in planet_list:
+            pygame.draw.circle(screen, planet['color'], (int(planet['x']), int(planet['y'])), planet['size'])
+
+        title = score_font.render("MISSION ACCOMPLIE !", True, GOLD)
+        title_rect = title.get_rect(center=(screen_width//2, 70))
+        screen.blit(title, title_rect)
+
+        yw_rect = youwin_image.get_rect(center=(screen_width//2, screen_height//2 - 10))
+        screen.blit(youwin_image, yw_rect)
+
+        summary = subtitle_font.render(
+            f"Score final: {score} | Ingredients recuperes: {len(ingredients_collected)}",
+            True,
+            WHITE
+        )
+        summary_rect = summary.get_rect(center=(screen_width//2, screen_height//2 + 120))
+        screen.blit(summary, summary_rect)
+
+        replay_surf = score_font.render("R: rejouer", True, GREEN)
+        replay_rect = replay_surf.get_rect(center=(screen_width//2, screen_height//2 + 170))
+        screen.blit(replay_surf, replay_rect)
+
+        menu_surf = subtitle_font.render("SPACE: menu   Q: quitter", True, WHITE)
+        menu_rect = menu_surf.get_rect(center=(screen_width//2, screen_height//2 + 210))
+        screen.blit(menu_surf, menu_rect)
+
+        pygame.display.flip()
+        continue
+
     # === Écran JEU (PLAYING) ===
     # Gestion des événements
     for event in pygame.event.get():
@@ -802,6 +1369,25 @@ while running:
                 shield_start_time = now
                 shield_charges -= 1
                 create_explosion(astro_x + 40, astro_y + 40, color=BLUE, num_particles=20)
+            if event.key == pygame.K_j and hyper_charges > 0 and not hyper_active:
+                hyper_active = True
+                hyper_start_time = now
+                hyper_last_fx_time = now
+                hyper_charges -= 1
+                hyper_last_granted_time = now
+                hyper_inv_anim['active'] = True
+                hyper_inv_anim['start'] = now
+                create_explosion(astro_x + 40, astro_y + 40, color=YELLOW, num_particles=35)
+                dash_impulse = speed * 1.8
+                if astro_facing == "left":
+                    astro_vx -= dash_impulse
+                elif astro_facing == "right":
+                    astro_vx += dash_impulse
+                elif astro_facing == "up":
+                    astro_vy -= dash_impulse
+                else:
+                    astro_vy += dash_impulse
+                play_sound(hyper_dash_sound)
             if event.key == pygame.K_SPACE:
                 current_time = pygame.time.get_ticks()
                 if current_time >= next_shot_allowed_time and water_ammo > 0:
@@ -840,29 +1426,83 @@ while running:
                     bullet_list.append(bullet)
                     next_shot_allowed_time = current_time + cooldown_time
                     water_ammo -= 1
+                    play_sound(shoot_sound)
 
     # Gestion continue des touches (pour détecter plusieurs touches en même temps)
     keys = pygame.key.get_pressed()
-    # Gestion du déplacement avec diagonales
-    dx = dy = 0
+    # Déplacement inertiel : accélération, friction, glisse spatiale.
+    input_x = 0.0
+    input_y = 0.0
     if keys[pygame.K_LEFT]:
-        dx -= speed
-        astro_facing = "left"
+        input_x -= 1.0
     if keys[pygame.K_RIGHT]:
-        dx += speed
-        astro_facing = "right"
+        input_x += 1.0
     if keys[pygame.K_UP]:
-        dy -= speed
-        astro_facing = "up"
+        input_y -= 1.0
     if keys[pygame.K_DOWN]:
-        dy += speed
+        input_y += 1.0
+    if input_x != 0 and input_y != 0:
+        input_x *= 0.7071
+        input_y *= 0.7071
+
+    if input_x < 0:
+        astro_facing = "left"
+    elif input_x > 0:
+        astro_facing = "right"
+    elif input_y < 0:
+        astro_facing = "up"
+    elif input_y > 0:
         astro_facing = "down"
-    # Normaliser la vitesse en diagonale
-    if dx != 0 and dy != 0:
-        dx *= 0.7071  # 1/sqrt(2)
-        dy *= 0.7071
-    astro_x += dx
-    astro_y += dy
+    elif abs(astro_vx) + abs(astro_vy) > 0.35:
+        if abs(astro_vx) >= abs(astro_vy):
+            astro_facing = "right" if astro_vx > 0 else "left"
+        else:
+            astro_facing = "down" if astro_vy > 0 else "up"
+
+    max_speed = speed * (HYPER_DASH_MULTIPLIER if hyper_active else 1)
+    accel = ASTRO_ACCEL * (1.35 if hyper_active else 1.0)
+    if now < oxidized_debuff_until:
+        accel *= 0.72
+        max_speed *= 0.82
+
+    if input_x != 0:
+        astro_vx += input_x * accel
+    else:
+        astro_vx *= ASTRO_FRICTION
+
+    if input_y != 0:
+        astro_vy += input_y * accel
+    else:
+        astro_vy *= ASTRO_FRICTION
+
+    center_x = astro_x + astro_sprite_right.get_width() // 2
+    center_y = astro_y + astro_sprite_right.get_height() // 2
+    grav_dx, grav_dy, gravity_pull_planet, gravity_pull_strength = compute_planet_gravity_pull(
+        center_x, center_y, level_idx
+    )
+    astro_vx += grav_dx
+    astro_vy += grav_dy
+
+    astro_vx *= ASTRO_DRAG
+    astro_vy *= ASTRO_DRAG
+    velocity_mag = math.hypot(astro_vx, astro_vy)
+    if velocity_mag > max_speed:
+        scale = max_speed / velocity_mag
+        astro_vx *= scale
+        astro_vy *= scale
+    if abs(astro_vx) < 0.01:
+        astro_vx = 0.0
+    if abs(astro_vy) < 0.01:
+        astro_vy = 0.0
+
+    astro_move_dx = astro_vx
+    astro_move_dy = astro_vy
+    astro_x += astro_vx
+    astro_y += astro_vy
+
+    if hyper_active and now - hyper_last_fx_time >= 40:
+        create_explosion(astro_x + 40, astro_y + 40, color=YELLOW, num_particles=8)
+        hyper_last_fx_time = now
 
     # Wrap-around : traverser d'un bord à l'autre
     sprite_w = astro_sprite_right.get_width()
@@ -901,7 +1541,7 @@ while running:
     # Spawn d'ennemis selon configuration du niveau
     level_conf = levels.levels[level_idx]
     spawn_chance = 0.02
-    if random.random() < spawn_chance:
+    if not boss_active and random.random() < spawn_chance:
         # Choisir le type en fonction des poids du niveau
         spawn_weights = level_conf['spawn_weights']
         enemy_type = random.choices(
@@ -930,7 +1570,9 @@ while running:
             'x': x, 'y': y, 'width': enemy_width, 'height': enemy_height,
             'type': enemy_type, 'dx': dx, 'dy': dy,
             'speed': enemy_speed, 'health': enemy_health,
-            'bob_phase': random.uniform(0, 2 * math.pi)
+            'bob_phase': random.uniform(0, 2 * math.pi),
+            'anim_phase': random.uniform(0, 2 * math.pi),
+            'spawn_time': now
         })
     # Mise à jour des ennemis
     new_enemy_list = []
@@ -941,8 +1583,46 @@ while running:
             new_enemy_list.append(enemy)
     enemy_list = new_enemy_list
 
+    # Mise à jour du boss final (mouvement, phases, tirs).
+    if boss_active and boss_data:
+        health_ratio = boss_data['health'] / max(1, boss_data['max_health'])
+        if health_ratio > 0.66:
+            boss_data['phase'] = 1
+        elif health_ratio > 0.33:
+            boss_data['phase'] = 2
+        else:
+            boss_data['phase'] = 3
+
+        phase_speed = {1: 1.8, 2: 2.7, 3: 3.6}[boss_data['phase']]
+        boss_data['x'] += boss_data['vx'] * phase_speed
+        if boss_data['x'] <= 40:
+            boss_data['x'] = 40
+            boss_data['vx'] = 1
+        elif boss_data['x'] + boss_data['width'] >= screen_width - 40:
+            boss_data['x'] = screen_width - 40 - boss_data['width']
+            boss_data['vx'] = -1
+        boss_data['y'] = 90 + int(24 * math.sin(now / 380 + boss_data.get('seed', 0.0)))
+
+        shot_cooldown = {1: 1200, 2: 850, 3: 620}[boss_data['phase']]
+        if now - boss_data['last_shot'] >= shot_cooldown:
+            spawn_boss_projectiles(now, (astro_x + 25, astro_y + 25))
+
+        updated_boss_projectiles = []
+        for projectile in boss_projectiles:
+            projectile['x'] += projectile['dx']
+            projectile['y'] += projectile['dy']
+            projectile['lifetime'] -= 1
+            if (
+                projectile['lifetime'] > 0
+                and -30 <= projectile['x'] <= screen_width + 30
+                and -30 <= projectile['y'] <= screen_height + 30
+            ):
+                updated_boss_projectiles.append(projectile)
+        boss_projectiles = updated_boss_projectiles
+
     # Collision entre les tirs (jet d'eau) et les ennemis
     new_bullet_list = []
+    boss_defeated_this_frame = False
     for bullet in bullet_list:
         bullet_rect = bullet['rect']  # Le tir est maintenant dans bullet['rect']
         hit_enemy = False
@@ -963,23 +1643,75 @@ while running:
                         enemy_color = (255, 0, 0)  # rouge pour les chiens
                         score += 30
                     create_explosion(enemy['x'] + enemy['width'] // 2, enemy['y'] + enemy['height'] // 2, color=enemy_color)
+                    play_sound(explosion_sound)
                     enemy_list.remove(enemy)
                 hit_enemy = True
                 break
+        if not hit_enemy and boss_active and boss_data:
+            boss_rect = pygame.Rect(
+                boss_data['x'], boss_data['y'], boss_data['width'], boss_data['height']
+            )
+            if bullet_rect.colliderect(boss_rect):
+                boss_data['health'] -= 1
+                create_explosion(
+                    bullet_rect.centerx,
+                    bullet_rect.centery,
+                    color=(255, 110, 140),
+                    num_particles=10,
+                )
+                if boss_data['health'] <= 0:
+                    boss_defeated_this_frame = True
+                hit_enemy = True
         if not hit_enemy:
             new_bullet_list.append(bullet)
     bullet_list = new_bullet_list
 
+    if boss_defeated_this_frame:
+        boss_active = False
+        boss_defeated = True
+        boss_projectiles.clear()
+        create_explosion(
+            boss_data['x'] + boss_data['width'] // 2,
+            boss_data['y'] + boss_data['height'] // 2,
+            color=RED,
+            num_particles=120,
+        )
+        play_sound(explosion_sound)
+        if "ingredient_fragment_croquette" not in ingredients_collected:
+            ingredients_collected.append("ingredient_fragment_croquette")
+            ing_anim_active = True
+            ing_anim_start = now
+        enemy_list.clear()
+        croquette_list.clear()
+        water_item_list.clear()
+        hyper_item_list.clear()
+        astro_vx = 0.0
+        astro_vy = 0.0
+        astro_move_dx = 0.0
+        astro_move_dy = 0.0
+        game_state = "FINAL_WIN"
+        continue
+
+    player_rect = pygame.Rect(astro_x, astro_y, 50, 50)
+
     # Collision entre AstroPaws et les ennemis
     for enemy in enemy_list[:]:
         enemy_rect = pygame.Rect(enemy['x'], enemy['y'], enemy['width'], enemy['height'])
-        player_rect = pygame.Rect(astro_x, astro_y, 50, 50)
         if player_rect.colliderect(enemy_rect):
-            # Bouclier actif : élimination sans malus
-            if shield_active:
-                create_explosion(enemy['x'] + enemy['width']//2, enemy['y'] + enemy['height']//2, color=CYAN, num_particles=20)
+            # Bouclier ou Hyperdrive actif : invincibilité temporaire
+            if shield_active or hyper_active:
+                fx_color = CYAN if shield_active else YELLOW
+                fx_particles = 20 if shield_active else 30
+                create_explosion(
+                    enemy['x'] + enemy['width']//2,
+                    enemy['y'] + enemy['height']//2,
+                    color=fx_color,
+                    num_particles=fx_particles
+                )
+                play_sound(explosion_sound)
                 enemy_list.remove(enemy)
                 continue
+            astro_hit_flash_until = now + ASTRO_HIT_FLASH_DURATION
             if enemy['type'] == "dog":
                 lives -= 1
                 # Déclencher explosion du cœur retiré
@@ -991,6 +1723,7 @@ while running:
                 heart_y = 10 + heart_sprite.get_height()//2
                 create_explosion(heart_x, heart_y, color=RED, num_particles=30)
                 create_explosion(astro_x + 25, astro_y + 25, color=(255, 0, 0), num_particles=50)
+                play_sound(explosion_sound)
                 lost_life_surface = score_font.render("Vous avez perdu une vie!", True, WHITE)
                 screen.blit(lost_life_surface, (screen_width//2 - 100, screen_height//2))
                 pygame.display.flip()
@@ -998,10 +1731,56 @@ while running:
             elif enemy['type'] == "rat":
                 score -= 10
                 create_explosion(astro_x + 25, astro_y + 25)
+                play_sound(explosion_sound)
             else:  # mouse
                 score -= 5
                 create_explosion(astro_x + 25, astro_y + 25)
+                play_sound(explosion_sound)
             enemy_list.remove(enemy)
+
+    # Collision entre AstroPaws et les attaques du boss final.
+    if boss_active and boss_data:
+        boss_rect = pygame.Rect(
+            boss_data['x'], boss_data['y'], boss_data['width'], boss_data['height']
+        )
+        if player_rect.colliderect(boss_rect):
+            if shield_active or hyper_active:
+                create_explosion(
+                    boss_rect.centerx,
+                    boss_rect.centery,
+                    color=YELLOW if hyper_active else CYAN,
+                    num_particles=20,
+                )
+            elif now >= boss_contact_cooldown_until:
+                lives -= 1
+                boss_contact_cooldown_until = now + 900
+                astro_hit_flash_until = now + ASTRO_HIT_FLASH_DURATION
+                create_explosion(astro_x + 25, astro_y + 25, color=RED, num_particles=45)
+                play_sound(explosion_sound)
+
+        for projectile in boss_projectiles[:]:
+            radius = projectile['radius']
+            proj_rect = pygame.Rect(
+                projectile['x'] - radius,
+                projectile['y'] - radius,
+                radius * 2,
+                radius * 2,
+            )
+            if player_rect.colliderect(proj_rect):
+                if shield_active or hyper_active:
+                    create_explosion(
+                        projectile['x'],
+                        projectile['y'],
+                        color=CYAN if shield_active else YELLOW,
+                        num_particles=12,
+                    )
+                elif now >= boss_contact_cooldown_until:
+                    lives -= 1
+                    boss_contact_cooldown_until = now + 900
+                    astro_hit_flash_until = now + ASTRO_HIT_FLASH_DURATION
+                    create_explosion(astro_x + 25, astro_y + 25, color=(255, 70, 90), num_particles=30)
+                    play_sound(explosion_sound)
+                boss_projectiles.remove(projectile)
 
     # Vérifier Game Over: si les vies tombent à 0
     if lives <= 0:
@@ -1011,36 +1790,71 @@ while running:
 
     # Mise à jour de la liste des croquettes
     current_time = pygame.time.get_ticks()
-    croquette_list = [croquette for croquette in croquette_list if current_time - croquette['spawn_time'] < croquette_lifetime]
+    if not boss_active:
+        croquette_list = [
+            croquette
+            for croquette in croquette_list
+            if current_time - croquette['spawn_time'] < croquette_lifetime
+        ]
 
-    # Apparition de nouvelles croquettes
-    if random.random() < 0.01:  # environ 1% de chance par frame
-        x = random.randint(0, screen_width - croquette_size)
-        y = random.randint(0, screen_height - croquette_size)
-        spawn_time = pygame.time.get_ticks()
-        if random.random() < 0.1:
-            croquette_type = "rare"
-        else:
-            croquette_type = "normal"
-        croquette_list.append({'x': x, 'y': y, 'spawn_time': spawn_time, 'type': croquette_type})
+        # Apparition de nouvelles croquettes
+        if random.random() < 0.01:  # environ 1% de chance par frame
+            croquette_list.append(spawn_croquette())
 
-    # Collision entre AstroPaws et les croquettes
-    player_rect = pygame.Rect(astro_x, astro_y, 50, 50)
-    new_croquette_list = []
-    for croquette in croquette_list:
-        croquette_rect = pygame.Rect(croquette['x'], croquette['y'], croquette_size, croquette_size)
-        if player_rect.colliderect(croquette_rect):
-            if croquette.get('type') == "rare":
-                score += 10  # croquette rare désormais 10 points
+        # Collision entre AstroPaws et les croquettes
+        new_croquette_list = []
+        for croquette in croquette_list:
+            base_sprite = gold_croquette_sprite if croquette.get('type') == "rare" else brown_croquette_sprite
+            croq_w, croq_h = base_sprite.get_size()
+            croquette_rect = pygame.Rect(croquette['x'], croquette['y'], croq_w, croq_h)
+            oxidized = is_croquette_oxidized(croquette, level_idx, current_time)
+            if player_rect.colliderect(croquette_rect):
+                play_sound(pickup_sound)
+                if oxidized:
+                    score += OXIDIZED_BONUS_SCORE
+                    water_ammo = max(0, water_ammo - OXIDIZED_WATER_PENALTY)
+                    oxidized_debuff_until = current_time + OXIDIZED_DEBUFF_DURATION
+                    create_explosion(
+                        croquette_rect.centerx,
+                        croquette_rect.centery,
+                        color=(160, 220, 90),
+                        num_particles=18,
+                    )
+                elif croquette.get('type') == "rare":
+                    score += 10  # croquette rare désormais 10 points
+                else:
+                    score += 3   # croquette normale désormais 3 points
             else:
-                score += 3   # croquette normale désormais 3 points
-        else:
-            new_croquette_list.append(croquette)
-    croquette_list = new_croquette_list
+                new_croquette_list.append(croquette)
+        croquette_list = new_croquette_list
+    else:
+        croquette_list.clear()
 
     # Vérifier si on atteint le score cible du niveau
     target = levels.levels[level_idx]['target_score']
-    if score >= target:
+    if score >= target and not boss_active:
+        is_last_level = level_idx == len(levels.levels) - 1
+        if is_last_level and not boss_defeated:
+            final_level_item = levels.levels[level_idx]['end_item']
+            if final_level_item not in ingredients_collected:
+                ingredients_collected.append(final_level_item)
+                ing_anim_active = True
+                ing_anim_start = now
+
+            enemy_list.clear()
+            bullet_list.clear()
+            explosion_list.clear()
+            croquette_list.clear()
+            water_item_list.clear()
+            hyper_item_list.clear()
+            astro_vx = 0.0
+            astro_vy = 0.0
+            astro_move_dx = 0.0
+            astro_move_dy = 0.0
+            astro_hit_flash_until = 0
+            start_boss_fight(now)
+            continue
+
         # Animation de disparition du sprite mort sur 2 secondes
         # Préparez le message statique
         msg = score_font.render(f"{levels.levels[level_idx]['name']} terminé !", True, WHITE)
@@ -1084,49 +1898,42 @@ while running:
         ingredients_collected.append(levels.levels[level_idx]['end_item'])
         ing_anim_active = True
         ing_anim_start = now
-        # Mettre à jour l'inventaire et passer directement à l'intro du niveau suivant
-        if level_idx < len(levels.levels) - 1:
-            level_idx += 1
+        # Passer au niveau suivant.
+        level_idx += 1
+        game_state = "LEVEL_INTRO"
+
         enemy_list.clear()
+        bullet_list.clear()
+        explosion_list.clear()
         croquette_list.clear()
         water_item_list.clear()
+        hyper_item_list.clear()
+        croquette_list = [spawn_croquette() for _ in range(INITIAL_CROQUETTES)]
         game_start_time = None
-        game_state = "LEVEL_INTRO"
-        continue
-    # === Écran LEVEL_WIN ===
-    if game_state == "LEVEL_WIN":
-        # Affichage du même écran de victoire
-        screen.fill(BLACK)
-        for star in star_list:
-            pygame.draw.circle(screen, WHITE, (int(star['x']), int(star['y'])), 1)
-        for planet in planet_list:
-            pygame.draw.circle(screen, planet['color'], (int(planet['x']), int(planet['y'])), planet['size'])
-        win_msg = score_font.render("Vous avez passé le niveau !", True, WHITE)
-        win_rect = win_msg.get_rect(center=(screen_width//2, 60))
-        screen.blit(win_msg, win_rect)
-        yw_rect = youwin_image.get_rect(center=(screen_width//2, screen_height//2))
-        screen.blit(youwin_image, yw_rect)
-        next_name = levels.levels[level_idx]['name'] if level_idx < len(levels.levels) else "Fin du jeu"
-        sub_surf = score_font.render(f"Prochain : {next_name}", True, WHITE)
-        sub_rect = sub_surf.get_rect(center=(screen_width//2, screen_height//2 + 140))
-        screen.blit(sub_surf, sub_rect)
-        cont_surf = score_font.render("(Patientez...)", True, GREEN)
-        cont_rect = cont_surf.get_rect(center=(screen_width//2, screen_height - 50))
-        screen.blit(cont_surf, cont_rect)
-        pygame.display.flip()
-        # Transition automatique après 5 secondes
-        if level_win_start_time is not None and now - level_win_start_time >= 5000:
-            game_state = "LEVEL_INTRO"
-        else:
-            # Permettre de quitter la fenêtre
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
+        paused_time_accum = 0
+        hyper_active = False
+        hyper_start_time = None
+        astro_vx = 0.0
+        astro_vy = 0.0
+        astro_move_dx = 0.0
+        astro_move_dy = 0.0
+        astro_hit_flash_until = 0
         continue
 
     # Mise à jour des réserves d'eau (water items)
     current_time = pygame.time.get_ticks()
-    water_item_list = [item for item in water_item_list if current_time - item['spawn_time'] < 7000]  # durée de vie de 7 sec
+    water_item_lifetime = 9000 if boss_active else 7000
+    water_item_list = [
+        item for item in water_item_list
+        if current_time - item['spawn_time'] < water_item_lifetime
+    ]
+    if boss_active:
+        hyper_item_list.clear()
+    else:
+        hyper_item_list = [
+            item for item in hyper_item_list
+            if current_time - item['spawn_time'] < HYPER_PICKUP_LIFETIME
+        ]
     
     # Collision entre AstroPaws et les réserves d'eau
     for item in water_item_list[:]:
@@ -1139,14 +1946,50 @@ while running:
             # Déclencher clignotement du compteur d'eau
             water_anim['active'] = True
             water_anim['start'] = pygame.time.get_ticks()
+            play_sound(pickup_sound)
             water_item_list.remove(item)
     
     # Apparition de nouvelles réserves d'eau
-    if random.random() < 0.005:  # environ 0.5% de chance par frame
+    water_spawn_chance = 0.01 if boss_active else 0.005
+    if random.random() < water_spawn_chance:
         x = random.randint(0, screen_width - 10)
         y = random.randint(0, screen_height - 10)
         spawn_time = pygame.time.get_ticks()
         water_item_list.append({'x': x, 'y': y, 'spawn_time': spawn_time})
+
+    # Collision entre AstroPaws et les pickups Hyperdrive
+    for item in hyper_item_list[:]:
+        width = hyper_pickup_sprite.get_width()
+        height = hyper_pickup_sprite.get_height()
+        hyper_rect = pygame.Rect(item['x'], item['y'], width, height)
+        if player_rect.colliderect(hyper_rect):
+            hyper_charges += 1
+            hyper_unlocked = True
+            hyper_last_granted_time = current_time
+            hyper_inv_anim['active'] = True
+            hyper_inv_anim['start'] = current_time
+            create_explosion(
+                item['x'] + width // 2,
+                item['y'] + height // 2,
+                color=YELLOW,
+                num_particles=25
+            )
+            play_sound(hyper_pickup_sound)
+            hyper_item_list.remove(item)
+
+    # Apparition des pickups Hyperdrive (niveau qui porte l'item Hyperdrive)
+    level_conf = levels.levels[level_idx]
+    if (
+        not boss_active
+        and level_conf.get('item', {}).get('type') == 'hyperdrive'
+        and len(hyper_item_list) < 1
+        and random.random() < HYPER_PICKUP_SPAWN_CHANCE
+    ):
+        hw = hyper_pickup_sprite.get_width()
+        hh = hyper_pickup_sprite.get_height()
+        x = random.randint(0, screen_width - hw)
+        y = random.randint(0, screen_height - hh)
+        hyper_item_list.append({'x': x, 'y': y, 'spawn_time': current_time})
 
     # Mise à jour des particules d'explosion
     new_explosion_list = []
@@ -1173,6 +2016,8 @@ while running:
     # Arrêter animation inventaire bouclier
     if shield_inv_anim['active'] and now - shield_inv_anim['start'] > shield_inv_anim['duration']:
         shield_inv_anim['active'] = False
+    if hyper_inv_anim['active'] and now - hyper_inv_anim['start'] > hyper_inv_anim['duration']:
+        hyper_inv_anim['active'] = False
 
     # Affichage du fond spatial procédural avec teinte de niveau
     bg = levels.levels[level_idx]['bg_tint']
@@ -1199,54 +2044,84 @@ while running:
 
     # Dessiner les croquettes avec sprites
     for croquette in croquette_list:
-        if croquette.get('type') == "rare":
-            sprite = gold_croquette_sprite
+        rare = croquette.get('type') == "rare"
+        oxidized = is_croquette_oxidized(croquette, level_idx, now)
+        if rare:
+            sprite = gold_croquette_oxidized_sprite if oxidized else gold_croquette_sprite
         else:
-            sprite = brown_croquette_sprite
-        screen.blit(sprite, (croquette['x'], croquette['y']))
+            sprite = brown_croquette_oxidized_sprite if oxidized else brown_croquette_sprite
+
+        if oxidized:
+            pulse = 1.0 + 0.08 * math.sin(now / 110 + croquette['x'])
+            w = max(1, int(sprite.get_width() * pulse))
+            h = max(1, int(sprite.get_height() * pulse))
+            animated = pygame.transform.smoothscale(sprite, (w, h))
+            rect = animated.get_rect(
+                center=(
+                    croquette['x'] + sprite.get_width() // 2,
+                    croquette['y'] + sprite.get_height() // 2,
+                )
+            )
+            screen.blit(animated, rect.topleft)
+            pygame.draw.circle(
+                screen,
+                (150, 220, 80),
+                rect.center,
+                max(rect.width, rect.height) // 2 + 3,
+                1,
+            )
+        else:
+            screen.blit(sprite, (croquette['x'], croquette['y']))
     # Dessiner les réserves d'eau avec sprite
     for item in water_item_list:
         screen.blit(water_sprite, (item['x'], item['y']))
-    # Dessiner les ennemis avec des sprites et animation de flottement (bob)
-    current_time = pygame.time.get_ticks()
+    # Dessiner les pickups Hyperdrive avec un léger pulse
+    pulse_factor = 1.0 + 0.12 * math.sin(now / 120)
+    for item in hyper_item_list:
+        base_w, base_h = hyper_pickup_sprite.get_size()
+        w = max(1, int(base_w * pulse_factor))
+        h = max(1, int(base_h * pulse_factor))
+        sprite = pygame.transform.scale(hyper_pickup_sprite, (w, h))
+        rect = sprite.get_rect(center=(item['x'] + base_w // 2, item['y'] + base_h // 2))
+        screen.blit(sprite, rect.topleft)
+    # Dessiner les ennemis avec animation avancée
     for enemy in enemy_list:
-        # Choisir le sprite selon le type
-        if enemy['type'] == "mouse":
-            sprite = mouse_sprite
-        elif enemy['type'] == "rat":
-            sprite = rat_sprite
-        else:  # dog
-            sprite = dog_sprite
-        # Calculer un décalage vertical (bob) plus marqué et plus rapide
-        bob_offset = math.sin(current_time / 300 + enemy.get('bob_phase', 0)) * 15
-        # Dessiner le sprite avec le bob vertical
-        screen.blit(sprite, (enemy['x'], enemy['y'] + bob_offset))
+        draw_enemy_animated(enemy, now)
+    # Dessiner le boss et ses projectiles
+    if boss_active and boss_data:
+        draw_boss(now)
+        for projectile in boss_projectiles:
+            pygame.draw.circle(
+                screen,
+                projectile['color'],
+                (int(projectile['x']), int(projectile['y'])),
+                projectile['radius'],
+            )
     # Dessiner les particules d'explosion
     for particle in explosion_list:
         pygame.draw.circle(screen, particle['color'], (int(particle['x']), int(particle['y'])), 2)
     # Afficher les tirs (jet d'eau bleu)
     for bullet in bullet_list:
         pygame.draw.rect(screen, BLUE, bullet['rect'])
-    # Afficher AstroPaws selon la direction
-    if astro_facing == "left":
-        screen.blit(astro_sprite_left, (astro_x, astro_y))
-    elif astro_facing == "right":
-        screen.blit(astro_sprite_right, (astro_x, astro_y))
-    elif astro_facing == "up":
-        screen.blit(astro_sprite_up, (astro_x, astro_y))
-    else:  # "down"
-        screen.blit(astro_sprite_down, (astro_x, astro_y))
-    # Dessiner un cercle de bouclier autour d'AstroPaws si actif
+    # Afficher AstroPaws avec animation dynamique
+    astro_rect = draw_astro_animated(
+        now_ms=now,
+        astro_pos_x=astro_x,
+        astro_pos_y=astro_y,
+        facing=astro_facing,
+        move_dx=astro_move_dx,
+        move_dy=astro_move_dy,
+        hyper_on=hyper_active,
+        hit_flash_until=astro_hit_flash_until,
+    )
+    # Dessiner les auras de protection autour d'AstroPaws
+    center_x, center_y = astro_rect.center
+    base_radius = max(astro_rect.width, astro_rect.height) // 2 + 5
     if shield_active:
-        # Déterminer le centre du sprite
-        sprite_w = astro_sprite_right.get_width()
-        sprite_h = astro_sprite_right.get_height()
-        center_x = astro_x + sprite_w // 2
-        center_y = astro_y + sprite_h // 2
-        # Rayon légèrement supérieur à la moitié du sprite
-        radius = max(sprite_w, sprite_h) // 2 + 5
-        # Tracer un cercle en CYAN d'épaisseur 3 px
-        pygame.draw.circle(screen, CYAN, (center_x, center_y), radius, 3)
+        pygame.draw.circle(screen, CYAN, (center_x, center_y), base_radius, 3)
+    if hyper_active:
+        pulse = int(3 * math.sin(now / 70))
+        pygame.draw.circle(screen, YELLOW, (center_x, center_y), base_radius + 6 + pulse, 3)
     
     # Afficher Score (clignote en rouge si score négatif)
     score_color = RED if (score < 0 and score_blink) else WHITE
@@ -1256,10 +2131,35 @@ while running:
     water_color = BLUE if water_anim['active'] else WHITE
     water_surface = score_font.render(f"Water: {water_ammo}", True, water_color)
     screen.blit(water_surface, (10, 50))
+    if gravity_pull_strength > 0:
+        grav_pct = int(min(99, gravity_pull_strength * 550))
+        grav_surface = subtitle_font.render(f"Gravite locale: {grav_pct}%", True, CYAN)
+        screen.blit(grav_surface, (10, 92))
+    if now < oxidized_debuff_until:
+        corrosion_remaining = max(0.0, (oxidized_debuff_until - now) / 1000.0)
+        corrosion_surf = subtitle_font.render(
+            f"Corrosion: commandes perturbees ({corrosion_remaining:.1f}s)",
+            True,
+            (170, 230, 90),
+        )
+        screen.blit(corrosion_surf, (10, 124))
     # Afficher les vies sous forme de cœurs en haut à droite
     for i in range(lives):
         x = screen_width - (heart_sprite.get_width() + 10) * (i + 1)
         screen.blit(heart_sprite, (x, 10))
+    if boss_active and boss_data:
+        bw, bh = 320, 14
+        bx, by = screen_width//2 - bw//2, 36
+        ratio = max(0.0, boss_data['health']) / max(1, boss_data['max_health'])
+        pygame.draw.rect(screen, WHITE, (bx, by, bw, bh), 2)
+        pygame.draw.rect(screen, RED, (bx, by, int(bw * ratio), bh))
+        boss_label = subtitle_font.render(
+            f"{boss_data['name']} - Phase {boss_data['phase']}",
+            True,
+            WHITE,
+        )
+        label_rect = boss_label.get_rect(midbottom=(screen_width//2, by - 4))
+        screen.blit(boss_label, label_rect)
     # Barre de bouclier si actif
     if shield_active:
         remaining = shield_duration - (now - shield_start_time)
@@ -1270,6 +2170,15 @@ while running:
         pygame.draw.rect(screen, BLUE, (bx, by, int(bw * ratio), bh))
         if remaining <= 0:
             shield_active = False
+    if hyper_active and hyper_start_time is not None:
+        remaining = HYPER_DASH_DURATION - (now - hyper_start_time)
+        ratio = max(0, remaining) / HYPER_DASH_DURATION
+        bw, bh = 200, 10
+        bx, by = screen_width//2 - bw//2, 88
+        pygame.draw.rect(screen, WHITE, (bx, by, bw, bh), 2)
+        pygame.draw.rect(screen, YELLOW, (bx, by, int(bw * ratio), bh))
+        if remaining <= 0:
+            hyper_active = False
 
     # Affichage de l'inventaire en bas à gauche (icônes + compteurs)
     x0 = 10
@@ -1286,7 +2195,8 @@ while running:
 
     # Hyperdrive
     screen.blit(hyper_icon, (x0 + 100, y0))
-    hyper_count = score_font.render(f"x{hyper_charges}", True, WHITE)
+    hyper_color = YELLOW if hyper_active or (hyper_inv_anim['active'] and ((now - hyper_inv_anim['start']) // 250) % 2 == 0) else WHITE
+    hyper_count = score_font.render(f"x{hyper_charges}", True, hyper_color)
     # Position dynamique à droite de l'icône
     screen.blit(hyper_count, (x0 + 100 + hyper_icon.get_width() + 10, y0 + 4))
 
@@ -1316,7 +2226,8 @@ while running:
         screen.blit(draw_sprite, rect)
 
     # Afficher le numéro de niveau en bas à droite
-    lvl_surf = score_font.render(f"Level {level_idx+1}", True, WHITE)
+    level_label = "BOSS FINAL" if boss_active else f"Level {level_idx+1}"
+    lvl_surf = score_font.render(level_label, True, WHITE)
     lvl_rect = lvl_surf.get_rect(bottomright=(screen_width - 10, screen_height - 10))
     screen.blit(lvl_surf, lvl_rect)
 

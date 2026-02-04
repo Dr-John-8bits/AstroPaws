@@ -12,6 +12,7 @@
 - [Mode d'emploi](#mode-demploi)
 - [Développement en cours](#développement-en-cours)
 - [Roadmap à court terme](#roadmap-à-court-terme)
+- [Checklist](#checklist)
 - [Installation](#installation)
 - [Création & Musique](#création--musique)
 - [Licence](#licence)
@@ -74,7 +75,7 @@ Tout le développement est disponible en ligne en toute transparence pour partag
 - Vies, explosions et conditions de game-over
 
 #### Progression & niveaux
-- Structure `levels.py` (seuils 25/40/60, teintes de fond par niveau)
+- Structure `levels.py` (seuils 25/80/120, teintes de fond par niveau)
 - Transitions cinématiques (mort animée → ingrédients → intro niveau → warp)
 - HUD “Level X” en bas-droite
 
@@ -139,6 +140,14 @@ Tout le développement est disponible en ligne en toute transparence pour partag
 #### Fonctionnalités secondaires
 - Sauvegarde high-scores
 - Écrans de crédits, tutoriels intégrés
+
+## ✅ Checklist
+
+La checklist de suivi (phase 0 -> phase 3) est maintenue ici :
+
+- [CHECKLIST.md](CHECKLIST.md)
+- Validation automatique Phase 0 : `python3 phase0_smoke_test.py`
+- Génération du pack audio 8-bit : `python3 tools/generate_audio.py`
 
 💾 **Installation :**
 
